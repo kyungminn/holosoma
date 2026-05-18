@@ -1,5 +1,6 @@
 import json
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -148,6 +149,18 @@ class WholeBodyTrackingPolicy(BasePolicy):
                 _show_warning()
         else:
             _show_warning()
+
+        # Stiff-hold blend state: captures the robot's pose at the moment stiff hold
+        # is (re)entered, then ramps both pose and gains from there toward the
+        # stiff_startup_pos / stiff_startup_kp / stiff_startup_kd targets over
+        # `_stiff_blend_duration` seconds. Prevents the first-step torque spike that
+        # causes the motors to oscillate on entry.
+        self._stiff_blend_duration = float(
+            getattr(config.task, "stiff_blend_duration_sec", 2.0)
+        )
+        self._stiff_blend_started = False
+        self._stiff_blend_start_time = 0.0
+        self._stiff_blend_initial_pose: np.ndarray | None = None
 
     def _get_ref_body_orientation_in_world(self, robot_state_data):
         # Create configuration for pinocchio robot
@@ -398,6 +411,7 @@ class WholeBodyTrackingPolicy(BasePolicy):
         self.motion_start_timestep = None
         self._last_clock_reading = None
         self._stiff_hold_active = True
+        self._stiff_blend_started = False
         self.robot_yaw_offset = 0.0
 
     def get_init_target(self, robot_state_data):
@@ -811,15 +825,36 @@ class WholeBodyTrackingPolicy(BasePolicy):
         # just use the motor_kp/motor_kd when calling it in _fill_motor_commands
         if not self._stiff_hold_active:
             return None
+
+        # Capture the pose at the moment we (re)enter stiff hold so we can blend
+        # from there toward stiff_hold_q. Without this the first step jumps from
+        # the robot's current pose straight to stiff_hold_q at full kp, which
+        # saturates the motors and produces the visible shaking on entry.
+        if not self._stiff_blend_started:
+            self._stiff_blend_initial_pose = robot_state_data[:, 7 : 7 + self.num_dofs].astype(
+                np.float32, copy=True
+            )
+            self._stiff_blend_start_time = time.perf_counter()
+            self._stiff_blend_started = True
+
+        elapsed = time.perf_counter() - self._stiff_blend_start_time
+        blend = min(elapsed / self._stiff_blend_duration, 1.0)
+
+        q_target = self._stiff_blend_initial_pose + (
+            self._stiff_hold_q - self._stiff_blend_initial_pose
+        ) * blend
         return {
-            "q": self._stiff_hold_q.copy(),
-            "kp": self._stiff_hold_kp,
-            "kd": self._stiff_hold_kd,
+            "q": q_target.astype(np.float32, copy=False),
+            "kp": self._stiff_hold_kp * blend,
+            "kd": self._stiff_hold_kd * blend,
         }
 
     def _handle_start_policy(self):
         super()._handle_start_policy()
         self._stiff_hold_active = False
+        # Arm a fresh blend for the next time stiff hold reactivates (motion clip
+        # end, manual stop, or policy switch).
+        self._stiff_blend_started = False
         self._capture_robot_yaw_offset()
         self._capture_motion_yaw_offset(self.ref_quat_xyzw_0)
 
