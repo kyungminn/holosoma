@@ -404,12 +404,8 @@ class WholeBodyTrackingPolicy(BasePolicy):
         """Get initialization target joint positions."""
         dof_pos = robot_state_data[:, 7 : 7 + self.num_dofs]
         if self.get_ready_state:
-            # Interpolate from current dof_pos to first pose in motion command
             target_dof_pos = self.motion_command_0[:, : self.num_dofs]
-
-            q_target = dof_pos + (target_dof_pos - dof_pos) * (self.init_count / 500)
-            self.init_count += 1
-            return q_target
+            return self._blend_joint_pos(dof_pos, target_dof_pos)
         return dof_pos
 
     def get_current_obs_buffer_dict(self, robot_state_data):

@@ -256,8 +256,9 @@ class BasePolicy:
     def _init_command_components(self):
         """Initialize control-related components and commands."""
         self.use_policy_action = False
-        self.init_count = 0
         self.get_ready_state = False
+        self.init_ramp_duration_sec = float(getattr(self.config.task, "init_ramp_duration_sec", 10.0))
+        self._init_start_time: float | None = None
         self.desired_base_height = self.config.task.desired_base_height
         self.gait_period = self.config.task.gait_period
 
@@ -540,14 +541,24 @@ class BasePolicy:
     # Control/Command Methods
     # ============================================================================
 
+    def _blend_joint_pos(self, current_pos: np.ndarray, target_pos: np.ndarray) -> np.ndarray:
+        """Time-based linear blend from current_pos toward target_pos.
+
+        Returns target_pos once `init_ramp_duration_sec` has elapsed since
+        `_handle_init_state` set `_init_start_time`. Independent of `rl_rate`,
+        so the ramp duration in seconds is preserved across control frequencies.
+        """
+        if self._init_start_time is None:
+            return current_pos
+        elapsed = time.perf_counter() - self._init_start_time
+        blend_ratio = min(elapsed / self.init_ramp_duration_sec, 1.0)
+        return current_pos + (target_pos - current_pos) * blend_ratio
+
     def get_init_target(self, robot_state_data):
         """Get initialization target joint positions."""
         dof_pos = robot_state_data[:, 7 : 7 + self.num_dofs]
         if self.get_ready_state:
-            # Interpolate from current dof_pos to default angles
-            q_target = dof_pos + (self.default_dof_angles - dof_pos) * (self.init_count / 500)
-            self.init_count += 1
-            return q_target
+            return self._blend_joint_pos(dof_pos, self.default_dof_angles)
         return dof_pos
 
     def policy_action(self):
@@ -565,7 +576,6 @@ class BasePolicy:
             # Determine target joint positions
             if self.get_ready_state:
                 q_target = self.get_init_target(robot_state_data)
-                self.init_count = min(self.init_count, 500)
             elif not self.use_policy_action:
                 manual_cmd = self._get_manual_command(robot_state_data)
                 if manual_cmd is not None:
@@ -729,7 +739,7 @@ class BasePolicy:
     def _handle_init_state(self):
         """Handle initialization state."""
         self.get_ready_state = True
-        self.init_count = 0
+        self._init_start_time = time.perf_counter()
         self.logger.info("Setting to init state")
         if hasattr(self.interface, "no_action"):
             self.interface.no_action = 0
