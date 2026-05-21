@@ -1007,7 +1007,36 @@ class WholeBodyTrackingPolicy(BasePolicy):
             )
 
     def _handle_stop_policy(self):
-        """Handle stop policy action."""
+        """Handle stop policy action.
+
+        If the motion clip is still progressing and we are not already in the
+        natural-end hand-off, treat the stop press as a request to fade the
+        motion target toward the default standing pose from the *current*
+        motion frame instead of slamming joints to ``stiff_startup_pos``.
+        A second stop press (after the hand-off is active, or before the
+        motion has started) still performs the legacy hard stop.
+        """
+        if (
+            self.motion_clip_progressing
+            and not getattr(self, "_motion_held_at_end", False)
+            and self.motion_data is not None
+        ):
+            self._motion_held_at_end = True
+            self._motion_held_t0 = time.perf_counter()
+            self._held_action_filt = None
+            self.motion_timestep = min(
+                self.motion_timestep,
+                self.motion_data["time_step_total"] - 1,
+            )
+            self.logger.info(
+                colored(
+                    f"Stop pressed mid-motion at frame {self.motion_timestep}; "
+                    "fading motion target toward default standing pose.",
+                    "green",
+                )
+            )
+            return
+
         self.use_policy_action = False
         self.get_ready_state = False
         self._stiff_hold_active = True
