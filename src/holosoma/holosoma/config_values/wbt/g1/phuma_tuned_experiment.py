@@ -23,6 +23,13 @@ Applied from upstream:
       transparently swaps the motion library's file list to the val subset
       for the eval and reloads training motions afterwards.
 
+Opt-in (off by default; toggle per-script):
+    * `empirical_normalization`: PPOConfig field for running mean/std
+      normalization of actor & critic obs (matches upstream's
+      `g1_29dof_wbt`). Defaults to False here so finetuning the existing
+      pretrained checkpoint (trained without normalization) is unaffected.
+      Enable via CLI: `--algo.config.empirical_normalization=True`.
+
 NOT applied (intentional):
     * PD-gain DR (`actuator_randomizer_state.enable_pd_gain`) is left ON.
       Upstream PR #76 disabled this to lift PPO sim metrics; that change is

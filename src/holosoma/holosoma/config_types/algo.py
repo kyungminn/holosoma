@@ -240,6 +240,9 @@ class PPOConfig:
     init_at_random_ep_len: bool = True
     """Whether to initialize at random episode length."""
 
+    empirical_normalization: bool = False
+    """Whether to apply running mean/std normalization to actor/critic observations."""
+
     eval_callbacks: Any = None
     """Evaluation callbacks configuration."""
 

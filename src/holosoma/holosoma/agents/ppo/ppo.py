@@ -5,6 +5,7 @@ import os
 from typing import TypedDict
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 from loguru import logger
 from rich.console import Console
@@ -37,6 +38,70 @@ from holosoma.utils.inference_helpers import (
 )
 
 console = Console()
+
+
+class EmpiricalNormalization(nn.Module):
+    """Normalize mean and variance of values based on empirical values."""
+
+    def __init__(self, shape, device, eps=1e-2, until=None):
+        super().__init__()
+        self.eps = eps
+        self.until = until
+        self.device = device
+        self.register_buffer("_mean", torch.zeros(shape).unsqueeze(0).to(device))
+        self.register_buffer("_var", torch.ones(shape).unsqueeze(0).to(device))
+        self.register_buffer("_std", torch.ones(shape).unsqueeze(0).to(device))
+        self.register_buffer("count", torch.tensor(0, dtype=torch.long).to(device))
+
+    @torch.no_grad()
+    def forward(self, x: torch.Tensor, center: bool = True, update: bool = True) -> torch.Tensor:
+        if x.shape[1:] != self._mean.shape[1:]:
+            raise ValueError(f"Expected input of shape (*,{self._mean.shape[1:]}), got {x.shape}")
+
+        if self.training and update:
+            self.update(x)
+        if center:
+            return (x - self._mean) / (self._std + self.eps)
+        return x / (self._std + self.eps)
+
+    @torch.jit.unused
+    def update(self, x):
+        if self.until is not None and self.count >= self.until:
+            return
+
+        if dist.is_available() and dist.is_initialized():
+            local_batch_size = x.shape[0]
+            world_size = dist.get_world_size()
+            global_batch_size = world_size * local_batch_size
+
+            x_shifted = x - self._mean
+            local_sum_shifted = torch.sum(x_shifted, dim=0, keepdim=True)
+            local_sum_sq_shifted = torch.sum(x_shifted.pow(2), dim=0, keepdim=True)
+
+            stats_to_sync = torch.cat([local_sum_shifted, local_sum_sq_shifted], dim=0)
+            dist.all_reduce(stats_to_sync, op=dist.ReduceOp.SUM)
+            global_sum_shifted, global_sum_sq_shifted = stats_to_sync
+
+            batch_mean_shifted = global_sum_shifted / global_batch_size
+            batch_var = global_sum_sq_shifted / global_batch_size - batch_mean_shifted.pow(2)
+            batch_mean = batch_mean_shifted + self._mean
+        else:
+            global_batch_size = x.shape[0]
+            batch_mean = torch.mean(x, dim=0, keepdim=True)
+            batch_var = torch.var(x, dim=0, keepdim=True, unbiased=False)
+
+        new_count = self.count + global_batch_size
+
+        delta = batch_mean - self._mean
+        self._mean.copy_(self._mean + delta * (global_batch_size / new_count))
+
+        delta2 = batch_mean - self._mean
+        m_a = self._var * self.count
+        m_b = batch_var * global_batch_size
+        M2 = m_a + m_b + delta2.pow(2) * (self.count * global_batch_size / new_count)
+        self._var.copy_(M2 / new_count)
+        self._std.copy_(self._var.sqrt())
+        self.count.copy_(new_count)
 
 
 class Minibatch(TypedDict):
@@ -158,6 +223,7 @@ class PPO(BaseAlgo):
 
         # Observation related Config
         self.use_symmetry = self.config.use_symmetry
+        self.empirical_normalization = self.config.empirical_normalization
         self._init_obs_keys()
 
     def _init_obs_keys(self):
@@ -367,6 +433,15 @@ class PPO(BaseAlgo):
             height_map_encoder_config=height_map_encoder_config,
         )
 
+        actor_obs_dim = self._get_obs_dim(self.actor_obs_keys)
+        critic_obs_dim = self._get_obs_dim(self.critic_obs_keys)
+        if self.empirical_normalization:
+            self.actor_obs_normalizer: nn.Module = EmpiricalNormalization(shape=actor_obs_dim, device=self.device)
+            self.critic_obs_normalizer: nn.Module = EmpiricalNormalization(shape=critic_obs_dim, device=self.device)
+        else:
+            self.actor_obs_normalizer = nn.Identity()
+            self.critic_obs_normalizer = nn.Identity()
+
         if self.use_symmetry:
             self.symmetry_utils = SymmetryUtils(self.env)
 
@@ -399,6 +474,16 @@ class PPO(BaseAlgo):
         """
         actor_obs_dim = self._get_obs_dim(self.actor_obs_keys)
         return torch.zeros(1, actor_obs_dim, device=self.device)
+
+    def _normalize_actor_obs(self, actor_obs: torch.Tensor, update: bool = True) -> torch.Tensor:
+        if self.empirical_normalization:
+            return self.actor_obs_normalizer(actor_obs, update=update)
+        return actor_obs
+
+    def _normalize_critic_obs(self, critic_obs: torch.Tensor, update: bool = True) -> torch.Tensor:
+        if self.empirical_normalization:
+            return self.critic_obs_normalizer(critic_obs, update=update)
+        return critic_obs
 
     def _setup_storage(self):
         self.storage = RolloutStorage(self.env.num_envs, self.config.num_steps_per_env, device=self.device)
@@ -460,10 +545,14 @@ class PPO(BaseAlgo):
     def _eval_mode(self):
         self.actor.eval()
         self.critic.eval()
+        self.actor_obs_normalizer.eval()
+        self.critic_obs_normalizer.eval()
 
     def _train_mode(self):
         self.actor.train()
         self.critic.train()
+        self.actor_obs_normalizer.train()
+        self.critic_obs_normalizer.train()
 
     def learn(self):
         self._train_mode()
@@ -520,9 +609,11 @@ class PPO(BaseAlgo):
         with torch.inference_mode():
             for _ in range(self.config.num_steps_per_env):
                 # Environment step
-                actor_obs = torch.cat([obs_dict[k] for k in self.actor_obs_keys], dim=1)
-                critic_obs = torch.cat([obs_dict[k] for k in self.critic_obs_keys], dim=1)
-                
+                actor_obs_raw = torch.cat([obs_dict[k] for k in self.actor_obs_keys], dim=1)
+                critic_obs_raw = torch.cat([obs_dict[k] for k in self.critic_obs_keys], dim=1)
+                actor_obs = self._normalize_actor_obs(actor_obs_raw)
+                critic_obs = self._normalize_critic_obs(critic_obs_raw)
+
                 # Prepare policy state dict
                 policy_state = {"actor_obs": actor_obs, "critic_obs": critic_obs}
 
@@ -566,6 +657,7 @@ class PPO(BaseAlgo):
                 final_rewards = torch.zeros_like(rewards)
                 if infos["time_outs"].any():
                     final_critic_obs = torch.cat([infos["final_observations"][k] for k in self.critic_obs_keys], dim=1)
+                    final_critic_obs = self._normalize_critic_obs(final_critic_obs, update=False)
                     final_policy_state = {"critic_obs": final_critic_obs}
                     if self.use_height_map:
                         final_policy_state["height_map_obs"] = infos["final_observations"].get(
@@ -612,6 +704,7 @@ class PPO(BaseAlgo):
 
             # Return / Advantage computation
             last_critic_obs = torch.cat([obs_dict[k] for k in self.critic_obs_keys], dim=1)
+            last_critic_obs = self._normalize_critic_obs(last_critic_obs, update=False)
             last_policy_state = {"critic_obs": last_critic_obs}
             if self.use_height_map:
                 last_policy_state["height_map_obs"] = obs_dict["height_map_obs"]
@@ -932,6 +1025,10 @@ class PPO(BaseAlgo):
                     logger.info(
                         f"Critic non-strict load: missing={list(critic_missing)} unexpected={list(critic_unexpected)}"
                     )
+            if self.empirical_normalization and loaded_dict.get("actor_obs_normalizer_state_dict") is not None:
+                self.actor_obs_normalizer.load_state_dict(loaded_dict["actor_obs_normalizer_state_dict"])
+            if self.empirical_normalization and loaded_dict.get("critic_obs_normalizer_state_dict") is not None:
+                self.critic_obs_normalizer.load_state_dict(loaded_dict["critic_obs_normalizer_state_dict"])
             if self.config.load_optimizer:
                 if not strict:
                     logger.info("Skipping optimizer state load because strict=False (param groups likely differ)")
@@ -952,6 +1049,12 @@ class PPO(BaseAlgo):
             "critic_model_state_dict": self.critic.state_dict(),
             "actor_optimizer_state_dict": self.actor_optimizer.state_dict(),
             "critic_optimizer_state_dict": self.critic_optimizer.state_dict(),
+            "actor_obs_normalizer_state_dict": (
+                self.actor_obs_normalizer.state_dict() if self.empirical_normalization else None
+            ),
+            "critic_obs_normalizer_state_dict": (
+                self.critic_obs_normalizer.state_dict() if self.empirical_normalization else None
+            ),
             "iter": self.current_learning_iteration,
             "infos": infos,
         }
@@ -1316,9 +1419,11 @@ class PPO(BaseAlgo):
         if use_height_map and use_motion_encoder:
             # Height map + motion encoder wrapper
             class ActorWithHeightMapAndMotionWrapper(nn.Module):
-                def __init__(self, actor, is_videomimic_hm, combine_mode):
+                def __init__(self, actor, actor_obs_normalizer, empirical_normalization, is_videomimic_hm, combine_mode):
                     super().__init__()
                     self.actor = actor
+                    self.actor_obs_normalizer = actor_obs_normalizer
+                    self.empirical_normalization = empirical_normalization
                     self.height_map_encoder = actor.height_map_encoder
                     self.motion_encoder = actor.motion_encoder
                     self.actor_module = actor.actor_module
@@ -1326,6 +1431,8 @@ class PPO(BaseAlgo):
                     self.combine_mode = combine_mode
 
                 def forward(self, actor_obs, height_map_obs, future_motion_targets):
+                    if self.empirical_normalization:
+                        actor_obs = self.actor_obs_normalizer(actor_obs, update=False)
                     if self.is_videomimic_hm:
                         map_latent = self.height_map_encoder(height_map_obs)
                     else:
@@ -1341,19 +1448,26 @@ class PPO(BaseAlgo):
                     combined_input = torch.cat([actor_obs, map_latent, motion_latent], dim=-1)
                     return self.actor_module(combined_input)
 
-            return ActorWithHeightMapAndMotionWrapper(self.actor, is_videomimic_hm, videomimic_combine_mode)
+            return ActorWithHeightMapAndMotionWrapper(
+                self.actor, self.actor_obs_normalizer, self.empirical_normalization,
+                is_videomimic_hm, videomimic_combine_mode,
+            )
         elif use_height_map:
             # Height map only wrapper
             class ActorWithHeightMapWrapper(nn.Module):
-                def __init__(self, actor, is_videomimic_hm, combine_mode):
+                def __init__(self, actor, actor_obs_normalizer, empirical_normalization, is_videomimic_hm, combine_mode):
                     super().__init__()
                     self.actor = actor
+                    self.actor_obs_normalizer = actor_obs_normalizer
+                    self.empirical_normalization = empirical_normalization
                     self.height_map_encoder = actor.height_map_encoder
                     self.actor_module = actor.actor_module
                     self.is_videomimic_hm = is_videomimic_hm
                     self.combine_mode = combine_mode
 
                 def forward(self, actor_obs, height_map_obs):
+                    if self.empirical_normalization:
+                        actor_obs = self.actor_obs_normalizer(actor_obs, update=False)
                     if self.is_videomimic_hm:
                         map_latent = self.height_map_encoder(height_map_obs)
                     else:
@@ -1367,34 +1481,45 @@ class PPO(BaseAlgo):
                     combined_input = torch.cat([actor_obs, map_latent], dim=-1)
                     return self.actor_module(combined_input)
 
-            return ActorWithHeightMapWrapper(self.actor, is_videomimic_hm, videomimic_combine_mode)
+            return ActorWithHeightMapWrapper(
+                self.actor, self.actor_obs_normalizer, self.empirical_normalization,
+                is_videomimic_hm, videomimic_combine_mode,
+            )
         elif use_motion_encoder:
             # Motion encoder wrapper: takes actor_obs and future_motion_targets
             class ActorWithMotionEncoderWrapper(nn.Module):
-                def __init__(self, actor):
+                def __init__(self, actor, actor_obs_normalizer, empirical_normalization):
                     super().__init__()
                     self.actor = actor
+                    self.actor_obs_normalizer = actor_obs_normalizer
+                    self.empirical_normalization = empirical_normalization
                     self.motion_encoder = actor.motion_encoder
                     self.actor_module = actor.actor_module
 
                 def forward(self, actor_obs, future_motion_targets):
+                    if self.empirical_normalization:
+                        actor_obs = self.actor_obs_normalizer(actor_obs, update=False)
                     # Same logic as PPOActorWithMotionEncoder.act_inference
                     motion_latent = self.motion_encoder(future_motion_targets)
                     combined_input = torch.cat([actor_obs, motion_latent], dim=-1)
                     return self.actor_module(combined_input)
 
-            return ActorWithMotionEncoderWrapper(self.actor)
+            return ActorWithMotionEncoderWrapper(self.actor, self.actor_obs_normalizer, self.empirical_normalization)
         else:
             # Standard wrapper: takes only actor_obs
             class ActorWrapper(nn.Module):
-                def __init__(self, actor):
+                def __init__(self, actor, actor_obs_normalizer, empirical_normalization):
                     super().__init__()
                     self.actor = actor
+                    self.actor_obs_normalizer = actor_obs_normalizer
+                    self.empirical_normalization = empirical_normalization
 
                 def forward(self, actor_obs):
+                    if self.empirical_normalization:
+                        actor_obs = self.actor_obs_normalizer(actor_obs, update=False)
                     return self.actor.act_inference({"actor_obs": actor_obs})
 
-            return ActorWrapper(self.actor)
+            return ActorWrapper(self.actor, self.actor_obs_normalizer, self.empirical_normalization)
 
     def env_step(self, actor_state):
         obs_dict, rewards, dones, extras = self.env.step(actor_state)
@@ -1547,6 +1672,7 @@ class PPO(BaseAlgo):
 
     def _pre_eval_env_step(self, actor_state: dict):
         actor_obs = torch.cat([actor_state["obs"][k] for k in self.actor_obs_keys], dim=1)
+        actor_obs = self._normalize_actor_obs(actor_obs, update=False)
         policy_input = {"actor_obs": actor_obs}
         if self.use_motion_encoder and "future_motion_targets" in actor_state["obs"]:
             policy_input["future_motion_targets"] = actor_state["obs"]["future_motion_targets"]
