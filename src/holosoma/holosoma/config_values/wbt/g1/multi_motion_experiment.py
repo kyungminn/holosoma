@@ -121,6 +121,12 @@ def _build_command_cfg(motion_config: MultiMotionConfig) -> CommandManagerCfg:
 @pydantic_dataclass(frozen=True)
 class _SuccessRateCbConfig:
     _target_: str = "holosoma.agents.callbacks.success_rate_callback.SuccessRateCallback"
+    # Optional val-set eval — when set, SR runs against the val split instead
+    # of the training split. Files are read from motion_dir (falls back to
+    # the training motion_dir when val_motion_dir is empty).
+    val_split_file: str = ""
+    val_motion_dir: str = ""
+    max_eval_motions: int = 0  # 0 = no cap; >0 caps eval to first N motions (quick verification)
 
 
 _eval_callbacks = {"success_rate": _SuccessRateCbConfig()}

@@ -557,6 +557,11 @@ class PPO(BaseAlgo):
     def learn(self):
         self._train_mode()
 
+        # Instantiate eval callbacks up-front so they can pre-warm any disk
+        # I/O (e.g. SuccessRateCallback caching its motion loaders) before the
+        # first eval triggers mid-training and stalls the loop.
+        self._create_eval_callbacks()
+
         obs_dict = self.env.reset_all()
 
         # Initialize environments with different episode length buffers

@@ -66,6 +66,7 @@ class _SuccessRateCbValConfig:
     _target_: str = "holosoma.agents.callbacks.success_rate_callback.SuccessRateCallback"
     val_split_file: str = "./split/phuma_val.txt"
     val_motion_dir: str = ""
+    max_eval_motions: int = 0  # 0 = no cap; >0 caps eval to first N motions (quick verification)
 
 
 _eval_callbacks_val = {"success_rate": _SuccessRateCbValConfig()}

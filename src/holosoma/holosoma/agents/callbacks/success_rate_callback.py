@@ -54,13 +54,77 @@ class SuccessRateCallback(RLEvalCallback):
         training_loop=None,
         val_split_file: str = "",
         val_motion_dir: str = "",
+        max_eval_motions: int = 0,
     ):
         super().__init__(config, training_loop)
         self._num_envs = training_loop.env.num_envs
         self._val_split_file = val_split_file or ""
         self._val_motion_dir = val_motion_dir or ""
+        self._max_eval_motions = max(0, int(max_eval_motions))
         self._using_val = False
         self._orig_all_npz_files: list[str] | None = None
+        # Cache (file_path, MotionLoader) pairs for the eval set so each eval
+        # uses the pre-loaded data instead of re-reading from disk. Populated
+        # lazily on the first `on_pre_evaluate_policy` call, when the env's
+        # motion_library is reachable; reused across subsequent evals.
+        self._eval_paths_cache: list[str] | None = None
+        self._eval_loaders_cache: list = []
+        # Build the cache at construction time when possible (caller has
+        # already triggered _create_eval_callbacks at script startup, before
+        # the training loop). If the env / motion_library is not ready yet,
+        # this is a no-op and the cache is populated on first eval.
+        try:
+            self._prepare_eval_cache()
+        except Exception as e:
+            logger.warning(
+                f"SuccessRateCallback: deferred eval cache prepare ({e}); "
+                "will retry on first evaluation."
+            )
+
+    def _prepare_eval_cache(self) -> None:
+        """Pre-build the list of eval motion paths + MotionLoader objects.
+
+        Reads all eval npz files once at startup so subsequent evals are
+        served from memory (no disk I/O, no `Loading motion file:` log spam).
+        Sized by `val_split_file` / `max_eval_motions` so memory usage is
+        bounded by the eval cap.
+        """
+        if self._eval_paths_cache is not None:
+            return
+        env = self.training_loop.env
+        mc = env.command_manager.get_state("motion_command")
+        if not hasattr(mc, "motion_library"):
+            raise RuntimeError("no motion_library on command")
+        lib = mc.motion_library
+
+        if self._val_split_file:
+            motion_dir = self._val_motion_dir or lib.motion_dir
+            files = self._build_val_file_list(motion_dir, self._val_split_file)
+        else:
+            files = list(lib._all_npz_files)
+
+        if self._max_eval_motions > 0 and len(files) > self._max_eval_motions:
+            files = files[: self._max_eval_motions]
+
+        logger.info(
+            f"SuccessRateCallback: pre-loading {len(files)} eval motions into memory cache"
+        )
+        loaders = []
+        for path in files:
+            loaders.append(
+                MotionLoader(
+                    path,
+                    lib._robot_body_names,
+                    lib._robot_joint_names,
+                    device="cpu",
+                )
+            )
+        self._eval_paths_cache = files
+        self._eval_loaders_cache = loaders
+        logger.info(
+            f"SuccessRateCallback: cached {len(loaders)} MotionLoader objects "
+            "(subsequent evals serve from RAM)"
+        )
 
     def _load_metadata(self):
         """Load per-motion skill/category from CSV if available.
@@ -186,14 +250,41 @@ class SuccessRateCallback(RLEvalCallback):
         self._motion_command = mc
         self._env = env
 
-        # Optionally swap to the val file list for the duration of this eval.
-        # Pool reload + restore happens in on_post_evaluate_policy.
+        # Lazily build the eval cache if startup-time construction failed
+        # (e.g. callback created before motion_library was ready).
+        if self._eval_paths_cache is None:
+            try:
+                self._prepare_eval_cache()
+            except Exception as e:
+                logger.warning(
+                    f"SuccessRateCallback: eval cache prepare failed ({e}); "
+                    "falling back to per-eval disk reads."
+                )
+
+        # Swap the motion_library's file list to the eval set so the existing
+        # batching logic in `_setup_batch` operates on it. If we have a
+        # pre-built cache, this replicates the cap+val behaviour without any
+        # extra disk reads (the MotionLoader objects come from the cache).
+        # Always restore the original list in `on_post_evaluate_policy`.
         self._using_val = bool(self._val_split_file)
-        if self._using_val:
+        if self._eval_paths_cache is not None and (
+            self._using_val or self._max_eval_motions > 0
+        ):
+            self._orig_all_npz_files = self._motion_library._all_npz_files
+            self._motion_library._all_npz_files = list(self._eval_paths_cache)
+        elif self._using_val:
+            # Cache prep failed but val was requested; fall back to disk read.
             self._orig_all_npz_files = self._motion_library._all_npz_files
             motion_dir = self._val_motion_dir or self._motion_library.motion_dir
             self._motion_library._all_npz_files = self._build_val_file_list(
                 motion_dir, self._val_split_file
+            )
+        elif self._max_eval_motions > 0 and (
+            len(self._motion_library._all_npz_files) > self._max_eval_motions
+        ):
+            self._orig_all_npz_files = self._motion_library._all_npz_files
+            self._motion_library._all_npz_files = (
+                self._motion_library._all_npz_files[: self._max_eval_motions]
             )
 
         self._num_motions = len(self._motion_library._all_npz_files)
@@ -242,17 +333,29 @@ class SuccessRateCallback(RLEvalCallback):
         mc = self._motion_command
         lib = self._motion_library
 
-        # Load exactly these motions into pool slots [0, batch_size)
+        # Load exactly these motions into pool slots [0, batch_size). Serve
+        # from the pre-loaded cache when its paths match this batch's slice
+        # (always true after on_pre_evaluate_policy installs the cached
+        # paths into `_all_npz_files`); otherwise fall back to disk.
         file_indices = list(range(start, end))
         loaders = []
+        use_cache = (
+            self._eval_paths_cache is not None
+            and lib._all_npz_files is not self._orig_all_npz_files
+            and len(self._eval_loaders_cache) >= end
+        )
         for fi in file_indices:
-            loader = MotionLoader(
-                lib._all_npz_files[fi],
-                lib._robot_body_names,
-                lib._robot_joint_names,
-                device="cpu",
-            )
-            loaders.append(loader)
+            if use_cache:
+                loaders.append(self._eval_loaders_cache[fi])
+            else:
+                loaders.append(
+                    MotionLoader(
+                        lib._all_npz_files[fi],
+                        lib._robot_body_names,
+                        lib._robot_joint_names,
+                        device="cpu",
+                    )
+                )
 
         # Check if we need to grow tensors
         if loaders:
@@ -511,11 +614,16 @@ class SuccessRateCallback(RLEvalCallback):
         # Restore original pool size
         self._motion_library.pool_size = self._orig_pool_size
 
-        # Restore the training file list and reload the pool with training
-        # motions so subsequent training rollouts are not contaminated with
-        # val-set motion data left in pool slots.
-        if self._using_val and self._orig_all_npz_files is not None:
+        # Restore the original file list. Only do a full pool reload when the
+        # pool was contaminated with val-set motion data (val swap); for the
+        # plain max_eval_motions cap, the pool slots contain training motions
+        # already and natural resampling (resample_interval) will refresh
+        # them — skipping the costly reload keeps periodic-eval overhead low.
+        if self._orig_all_npz_files is not None:
             self._motion_library._all_npz_files = self._orig_all_npz_files
-            self._motion_library._load_pool(list(range(self._motion_library.pool_size)))
+            if self._using_val:
+                self._motion_library._load_pool(
+                    list(range(self._motion_library.pool_size))
+                )
             self._orig_all_npz_files = None
             self._using_val = False
