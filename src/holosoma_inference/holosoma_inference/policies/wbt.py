@@ -1,5 +1,6 @@
 import json
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -100,7 +101,22 @@ class WholeBodyTrackingPolicy(BasePolicy):
 
         self._stiff_hold_active = True
         self.robot_yaw_offset = 0.0
-        
+        self.motion_yaw_offset = 0.0
+
+        # When True, motion playback is paused at the final frame and the
+        # motion target fades from the last frame toward the default standing
+        # pose while the policy keeps balancing. Setting this avoids the abrupt
+        # snap-to-stiff_hold that destabilizes the robot mid-stride.
+        self._motion_held_at_end = False
+        # Wall-clock timestamp at which the motion ended (used to fade the
+        # motion command from the last walking frame toward the default
+        # standing pose).
+        self._motion_held_t0 = None
+        # EMA-smoothed scaled_policy_action used only during the held phase.
+        # Mild smoothing reduces the visible wobble while still letting the
+        # policy correct balance fast enough to stay upright.
+        self._held_action_filt = None
+
         # Motion data for future_motion_targets (if needed)
         self.motion_data = None
         self.motion_fps = None
@@ -148,6 +164,15 @@ class WholeBodyTrackingPolicy(BasePolicy):
                 _show_warning()
         else:
             _show_warning()
+            # If we're going to simulate the ']' press later, override the base
+            # class's non-TTY auto-start so the robot stays in stiff hold until
+            # _handle_start_policy is actually called.
+            if float(getattr(config.task, "auto_press_start_policy_after_s", 0.0) or 0.0) > 0.0:
+                self.use_policy_action = False
+                logger.info(colored(
+                    f"[auto-start] holding stiff for {config.task.auto_press_start_policy_after_s:.1f}s before simulating ']'",
+                    "magenta",
+                ))
 
     def _get_ref_body_orientation_in_world(self, robot_state_data):
         # Create configuration for pinocchio robot
@@ -388,6 +413,7 @@ class WholeBodyTrackingPolicy(BasePolicy):
         self.motion_start_timestep = None
         self._last_clock_reading = None
         self.robot_yaw_offset = 0.0
+        self._motion_held_at_end = False
 
     def _on_policy_switched(self, model_path: str):
         super()._on_policy_switched(model_path)
@@ -399,6 +425,7 @@ class WholeBodyTrackingPolicy(BasePolicy):
         self._last_clock_reading = None
         self._stiff_hold_active = True
         self.robot_yaw_offset = 0.0
+        self._motion_held_at_end = False
 
     def get_init_target(self, robot_state_data):
         """Get initialization target joint positions."""
@@ -419,16 +446,45 @@ class WholeBodyTrackingPolicy(BasePolicy):
         if self.has_future_motion and self.motion_data is not None:
             # Compute motion_command from current timestep in motion data
             timestep = min(self.motion_timestep, self.motion_data["time_step_total"] - 1)
-            joint_pos_target = self.motion_data["joint_pos"][timestep]  # [num_dofs]
-            joint_vel_target = self.motion_data["joint_vel"][timestep]  # [num_dofs]
+            joint_pos_target = self.motion_data["joint_pos"][timestep].astype(np.float32)  # [num_dofs]
+            joint_vel_target = self.motion_data["joint_vel"][timestep].astype(np.float32)  # [num_dofs]
+            ref_body_idx = self.motion_data["ref_body_index"]
+            ref_quat_target = self.motion_data["body_quat_w"][timestep, ref_body_idx:ref_body_idx+1, :].astype(np.float32)
+            # When holding the final motion frame, fade the target from the
+            # last walking frame toward the default standing pose (zero
+            # velocities, upright torso) over a short window so the policy
+            # can settle the robot to a stable stand. 1s was found
+            # empirically — too long keeps the policy commanding a walking-ish
+            # pose for too long and the robot struggles to balance over the
+            # drawn-out fade.
+            #
+            # The orientation target preserves the *yaw* the robot was facing
+            # at motion end and only zeroes out roll/pitch. Fading yaw to zero
+            # would ask the robot to spin to face the world +X axis, which is
+            # unstable and unrelated to "standing up straight".
+            if getattr(self, "_motion_held_at_end", False):
+                fade_s = 1.0
+                elapsed = (time.perf_counter() - self._motion_held_t0) if self._motion_held_t0 is not None else 0.0
+                t = min(1.0, max(0.0, elapsed / fade_s))
+                alpha = t * t * (3.0 - 2.0 * t)  # smoothstep
+                joint_pos_target = (1.0 - alpha) * joint_pos_target + alpha * self.default_dof_angles.astype(np.float32)
+                joint_vel_target = np.zeros_like(joint_vel_target)
+                # Build yaw-only target quat from the last walking frame.
+                x, y, z, w = ref_quat_target[0]
+                yaw = float(np.arctan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z)))
+                half_yaw = 0.5 * yaw
+                yaw_only_xyzw = np.array(
+                    [[0.0, 0.0, np.sin(half_yaw), np.cos(half_yaw)]], dtype=np.float32
+                )
+                ref_quat_target = (1.0 - alpha) * ref_quat_target + alpha * yaw_only_xyzw
+                # Renormalize quaternion after blend.
+                ref_quat_target = ref_quat_target / (np.linalg.norm(ref_quat_target, axis=-1, keepdims=True) + 1e-8)
             self.motion_command_t = np.concatenate([
                 joint_pos_target[np.newaxis, :],
                 joint_vel_target[np.newaxis, :]
             ], axis=1).astype(np.float32)  # [1, 58]
-            
-            # Also update ref_quat from motion data (use ref_body_index, typically torso_link)
-            ref_body_idx = self.motion_data["ref_body_index"]
-            self.ref_quat_xyzw_t = self.motion_data["body_quat_w"][timestep, ref_body_idx:ref_body_idx+1, :].astype(np.float32)  # [1, 4] xyzw
+
+            self.ref_quat_xyzw_t = ref_quat_target  # [1, 4] xyzw
         
         current_obs_buffer_dict["motion_command"] = self.motion_command_t
 
@@ -579,12 +635,30 @@ class WholeBodyTrackingPolicy(BasePolicy):
 
         # Base angular velocity (yaw component only)
         base_ang_vel = motion["body_ang_vel_w"][future_timesteps, root_idx]  # [num_steps, 3]
+
+        # When we're holding the final motion frame, zero out the future
+        # velocities and fade root_height/roll_pitch toward standing defaults
+        # so the policy is told "settle into a stand here" rather than "keep
+        # moving with the mid-stride velocity in the last sample".
+        if getattr(self, "_motion_held_at_end", False):
+            base_lin_vel = np.zeros_like(base_lin_vel)
+            base_ang_vel = np.zeros_like(base_ang_vel)
+            fade_s = 1.0
+            elapsed = (time.perf_counter() - self._motion_held_t0) if self._motion_held_t0 is not None else 0.0
+            t_blend = min(1.0, max(0.0, elapsed / fade_s))
+            alpha_blend = t_blend * t_blend * (3.0 - 2.0 * t_blend)
+            default_root_height = float(self.config.task.desired_base_height)
+            root_height = (1.0 - alpha_blend) * root_height + alpha_blend * np.full_like(root_height, default_root_height)
+            roll_pitch = (1.0 - alpha_blend) * roll_pitch  # fade toward zero roll/pitch (mod 2π)
         base_yaw_vel = base_ang_vel[:, 2:3]  # [num_steps, 1]
         
         # Joint positions (relative to default)
         dof_pos = motion["joint_pos"][future_timesteps]  # [num_steps, num_dofs]
         default_dof_pos = self.default_dof_angles  # [num_dofs]
         dof_pos_rel = dof_pos - default_dof_pos[np.newaxis, :]  # [num_steps, num_dofs]
+        if getattr(self, "_motion_held_at_end", False):
+            # Fade dof_pos target toward default (rel = 0).
+            dof_pos_rel = (1.0 - alpha_blend) * dof_pos_rel
         
         # Local key body positions (tracked bodies relative to root) — optional
         if include_key_body_pos:
@@ -679,18 +753,74 @@ class WholeBodyTrackingPolicy(BasePolicy):
 
     def policy_action(self):
         # Check if motion finished on the previous cycle (set by rl_inference).
-        # Must be handled HERE before super().policy_action() checks use_policy_action,
-        # because _handle_stop_policy sets use_policy_action=False.
+        # We keep the policy running with the motion clamped to its final frame:
+        # the policy was actively balancing the robot during playback, and that
+        # active balance control is exactly what would be lost if we handed off
+        # to stiff_hold mid-stride.
         if getattr(self, '_motion_finished', False):
             self._motion_finished = False
             self.logger.info(
                 colored(
                     f"Motion clip finished ({self.motion_data['time_step_total']} frames). "
-                    "Switching to stiff hold.",
+                    "Fading motion target toward default standing pose; policy continues to balance.",
                     "green",
                 )
             )
-            self._handle_stop_policy()
+            # Keep `motion_clip_progressing=True` so rl_inference does not reset
+            # motion_timestep back to 0. Set a flag to stop clock-driven advance.
+            self._motion_held_at_end = True
+            self._motion_held_t0 = time.perf_counter()
+            self._held_action_filt = None  # reset EMA so it seeds on first sample
+            self.motion_timestep = self.motion_data["time_step_total"] - 1
+        # Auto-press '] ' (start policy) after a delay (debugging aid for non-interactive runs).
+        # Tracked relative to wall-clock start of this policy_action loop.
+        if not hasattr(self, "_auto_loop_t0"):
+            self._auto_loop_t0 = time.perf_counter()
+        # Periodic base-height log so we can tell from the log alone when the
+        # robot fell over (sim-to-sim debugging aid).
+        if float(getattr(self.config.task, "auto_press_start_policy_after_s", 0.0) or 0.0) > 0.0:
+            if not hasattr(self, "_last_height_log_t"):
+                self._last_height_log_t = 0.0
+            now = time.perf_counter() - self._auto_loop_t0
+            if now - self._last_height_log_t >= 0.5:
+                self._last_height_log_t = now
+                state = self.interface.get_low_state()
+                if state is not None:
+                    bz = float(state[0, 2])
+                    quat_wxyz = state[0, 3:7]
+                    # Tilt: angle from upright (z-axis) — compute body z-axis world-Z component.
+                    # body z in world = R * [0,0,1]; using quat in wxyz: z_w = 1 - 2*(x²+y²)
+                    x, y = float(quat_wxyz[1]), float(quat_wxyz[2])
+                    upright = 1.0 - 2.0 * (x * x + y * y)
+                    self.logger.info(
+                        f"[track] t={now:5.2f}s base_z={bz:.3f}m upright(cosθ)={upright:+.2f} "
+                        f"use_policy={self.use_policy_action} motion={self.motion_clip_progressing} "
+                        f"held={self._motion_held_at_end}"
+                    )
+        auto_press_delay = float(getattr(self.config.task, "auto_press_start_policy_after_s", 0.0) or 0.0)
+        if (
+            auto_press_delay > 0.0
+            and not getattr(self, "_auto_pressed_start", False)
+            and time.perf_counter() - self._auto_loop_t0 >= auto_press_delay
+        ):
+            self.logger.info(colored(f"[auto-start] simulating ']' (start policy) after {auto_press_delay:.1f}s", "magenta"))
+            self._handle_start_policy()
+            self._auto_pressed_start = True
+            self._auto_motion_t0 = time.perf_counter()
+        # Auto-start motion after a delay (measured from policy-start time).
+        auto_motion_delay = float(getattr(self.config.task, "auto_start_motion_after_s", 0.0) or 0.0)
+        if (
+            auto_motion_delay > 0.0
+            and self.use_policy_action
+            and not self.motion_clip_progressing
+            and not getattr(self, "_auto_started_motion", False)
+        ):
+            if not hasattr(self, "_auto_motion_t0"):
+                self._auto_motion_t0 = time.perf_counter()
+            if time.perf_counter() - self._auto_motion_t0 >= auto_motion_delay:
+                self.logger.info(colored(f"[auto-start] simulating 's' (start motion) after {auto_motion_delay:.1f}s", "magenta"))
+                self._handle_start_motion_clip()
+                self._auto_started_motion = True
         super().policy_action()
 
     def rl_inference(self, robot_state_data):
@@ -794,8 +924,30 @@ class WholeBodyTrackingPolicy(BasePolicy):
         # scale policy action
         self.scaled_policy_action = policy_action * self.policy_action_scale
 
+        # While holding the final motion frame, blend the commanded action with
+        # an EMA-smoothed copy. We delay the smoothing until the fade has
+        # completed (1 s) so the policy keeps full responsiveness during the
+        # actual fade — that's when residual walking momentum still needs
+        # correcting. After the robot has settled, we ramp the smoothing in
+        # over a few seconds to trade responsiveness for a steadier stand.
+        if getattr(self, "_motion_held_at_end", False) and self._motion_held_t0 is not None:
+            if self._held_action_filt is None:
+                self._held_action_filt = self.scaled_policy_action.copy()
+            ema_alpha = 0.4  # weight on the new (unsmoothed) action
+            self._held_action_filt = (
+                ema_alpha * self.scaled_policy_action
+                + (1.0 - ema_alpha) * self._held_action_filt
+            )
+            # Start EMA blend right after the pose fade completes, ramp over 3 s.
+            ramp_t = min(1.0, max(0.0, (time.perf_counter() - self._motion_held_t0 - 1.0) / 3.0))
+            ramp_alpha = ramp_t * ramp_t * (3.0 - 2.0 * ramp_t)  # smoothstep
+            self.scaled_policy_action = (
+                (1.0 - ramp_alpha) * self.scaled_policy_action
+                + ramp_alpha * self._held_action_filt
+            )
+
         # update motion timestep
-        if self.motion_clip_progressing:
+        if self.motion_clip_progressing and not getattr(self, "_motion_held_at_end", False):
             if self.use_sim_time:
                 self._update_clock()
             else:
@@ -859,6 +1011,7 @@ class WholeBodyTrackingPolicy(BasePolicy):
         self.use_policy_action = False
         self.get_ready_state = False
         self._stiff_hold_active = True
+        self._motion_held_at_end = False
         self.logger.info("Actions set to stiff startup command")
         if hasattr(self.interface, "no_action"):
             self.interface.no_action = 0
