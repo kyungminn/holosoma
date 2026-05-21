@@ -48,6 +48,12 @@ class TaskConfig:
     save_debug: bool = False
     """Save debug log for future_motion_targets (sim-to-sim) to compare with Isaac eval."""
 
+    auto_press_start_policy_after_s: float = 0.0
+    """If > 0, simulate pressing ']' (start policy) this many seconds after the process launches. Sim-to-sim debugging aid for non-interactive runs."""
+
+    auto_start_motion_after_s: float = 0.0
+    """If > 0, automatically start the motion clip this many seconds after the policy first activates (sim-to-sim debugging aid; bypasses the 's' key press)."""
+
     wandb_download_dir: str = "/tmp"
     """Directory for downloading W&B checkpoints."""
 
