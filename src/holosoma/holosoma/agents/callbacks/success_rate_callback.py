@@ -12,11 +12,16 @@ Definition:
 
 Also reports per-skill and per-category success rates when a CSV metadata file
 is available (e.g. split/phuma_train.csv).
+
+When ``val_split_file`` is provided, the callback temporarily replaces the
+motion library's file list with the val-filtered subset for the duration of
+the eval, then restores the training list and reloads the pool.
 """
 
 from __future__ import annotations
 
 import csv
+import glob as glob_module
 import os
 from collections import defaultdict
 
@@ -36,11 +41,26 @@ class SuccessRateCallback(RLEvalCallback):
     Processes all motions in sequential batches of num_envs. Each env is assigned
     a unique motion from the pool, starts at timestep 0, and runs until
     the motion ends or any body deviates > MOTION_FAR_THRESHOLD from reference.
+
+    If ``val_split_file`` is provided, evaluation runs against the val-filtered
+    subset of motions found in ``val_motion_dir`` (defaults to the training
+    motion_dir) instead of the training set. The training file list and pool
+    are restored after eval so subsequent training rollouts are unaffected.
     """
 
-    def __init__(self, config=None, training_loop=None):
+    def __init__(
+        self,
+        config=None,
+        training_loop=None,
+        val_split_file: str = "",
+        val_motion_dir: str = "",
+    ):
         super().__init__(config, training_loop)
         self._num_envs = training_loop.env.num_envs
+        self._val_split_file = val_split_file or ""
+        self._val_motion_dir = val_motion_dir or ""
+        self._using_val = False
+        self._orig_all_npz_files: list[str] | None = None
 
     def _load_metadata(self):
         """Load per-motion skill/category from CSV if available.
@@ -51,8 +71,11 @@ class SuccessRateCallback(RLEvalCallback):
         self._motion_skill = {}   # basename -> skill
         self._motion_category = {}  # basename -> category
 
-        mc = self._motion_command
-        split_file = getattr(mc.motion_cfg, "split_file", "")
+        if self._using_val:
+            split_file = self._val_split_file
+        else:
+            mc = self._motion_command
+            split_file = getattr(mc.motion_cfg, "split_file", "")
         if not split_file:
             return
 
@@ -82,6 +105,72 @@ class SuccessRateCallback(RLEvalCallback):
         """Extract basename without extension from npz path (e.g. 'Ways_to_Stand_Winded_clip1_chunk_0000')."""
         return os.path.splitext(os.path.basename(npz_path))[0]
 
+    def _get_motion_keys(self, npz_path: str) -> list[str]:
+        """Return candidate metadata-lookup keys for an npz path.
+
+        Different CSV conventions exist in this repo:
+            * phuma_train.csv uses bare basenames (e.g. 'Ways_to_Stand_..._chunk_0000')
+            * phuma_val.csv uses '<dir>_<filename>' (e.g. 'animation_Ways_to_...')
+
+        We generate both forms so a single matcher works for either CSV.
+        """
+        motion_dir = getattr(self._motion_library, "motion_dir", None)
+        keys: list[str] = []
+        if motion_dir:
+            try:
+                rel = os.path.relpath(npz_path, motion_dir)
+                stripped = os.path.splitext(rel)[0]
+                keys.append(stripped.replace(os.sep, "_"))
+            except ValueError:
+                pass
+        keys.append(self._get_motion_basename(npz_path))
+        # Deduplicate while preserving order
+        seen = set()
+        unique = []
+        for k in keys:
+            if k not in seen:
+                seen.add(k)
+                unique.append(k)
+        return unique
+
+    def _lookup_metadata(self, mapping: dict, npz_path: str) -> str | None:
+        for k in self._get_motion_keys(npz_path):
+            if k in mapping:
+                return mapping[k]
+        return None
+
+    def _build_val_file_list(self, motion_dir: str, split_file: str) -> list[str]:
+        """Mirror MotionLibrary's split-file filtering for a separate (val) split.
+
+        Globs all .npz under motion_dir, then keeps only those whose
+        motion_dir-relative path (without .npz) matches a line in split_file.
+        """
+        all_npz = sorted(glob_module.glob(os.path.join(motion_dir, "**", "*.npz"), recursive=True))
+        if not all_npz:
+            raise FileNotFoundError(f"SuccessRateCallback: no .npz files found in {motion_dir}")
+
+        with open(split_file, "r") as f:
+            split_keys = set(line.strip() for line in f if line.strip())
+
+        filtered = []
+        for npz_path in all_npz:
+            rel = os.path.relpath(npz_path, motion_dir)
+            key = os.path.splitext(rel)[0]
+            if key in split_keys:
+                filtered.append(npz_path)
+
+        if not filtered:
+            raise FileNotFoundError(
+                f"SuccessRateCallback: split file {split_file} ({len(split_keys)} keys) "
+                f"matched 0/{len(all_npz)} .npz files under {motion_dir}"
+            )
+
+        logger.info(
+            f"SuccessRateCallback (val): {len(filtered)}/{len(all_npz)} .npz files "
+            f"matched from {split_file}"
+        )
+        return filtered
+
     def on_pre_evaluate_policy(self):
         """Set up sequential motion assignment and tracking buffers."""
         env = self.training_loop.env
@@ -97,7 +186,17 @@ class SuccessRateCallback(RLEvalCallback):
         self._motion_command = mc
         self._env = env
 
-        self._num_motions = len(mc.motion_library._all_npz_files)
+        # Optionally swap to the val file list for the duration of this eval.
+        # Pool reload + restore happens in on_post_evaluate_policy.
+        self._using_val = bool(self._val_split_file)
+        if self._using_val:
+            self._orig_all_npz_files = self._motion_library._all_npz_files
+            motion_dir = self._val_motion_dir or self._motion_library.motion_dir
+            self._motion_library._all_npz_files = self._build_val_file_list(
+                motion_dir, self._val_split_file
+            )
+
+        self._num_motions = len(self._motion_library._all_npz_files)
         self._num_batches = (self._num_motions + self._num_envs - 1) // self._num_envs
 
         # Track per-motion results for each threshold
@@ -127,8 +226,9 @@ class SuccessRateCallback(RLEvalCallback):
         # our deterministic motion assignment and robot state initialization.
         self._needs_initial_setup = True
 
+        set_tag = "val" if self._using_val else "train"
         logger.info(
-            f"SuccessRateCallback: evaluating {self._num_motions} motions "
+            f"SuccessRateCallback ({set_tag}): evaluating {self._num_motions} motions "
             f"in {self._num_batches} batches of {self._num_envs} "
             f"(thresholds={MOTION_FAR_THRESHOLDS}m)"
         )
@@ -351,14 +451,14 @@ class SuccessRateCallback(RLEvalCallback):
 
                 lib = self._motion_library
                 for i in range(num_total):
-                    basename = self._get_motion_basename(lib._all_npz_files[i])
+                    npz_path = lib._all_npz_files[i]
                     failed = bool(terminate_np[i])
 
-                    skill = self._motion_skill.get(basename)
+                    skill = self._lookup_metadata(self._motion_skill, npz_path)
                     if skill:
                         skill_results[skill].append(failed)
 
-                    category = self._motion_category.get(basename)
+                    category = self._lookup_metadata(self._motion_category, npz_path)
                     if category:
                         category_results[category].append(failed)
 
@@ -410,3 +510,12 @@ class SuccessRateCallback(RLEvalCallback):
 
         # Restore original pool size
         self._motion_library.pool_size = self._orig_pool_size
+
+        # Restore the training file list and reload the pool with training
+        # motions so subsequent training rollouts are not contaminated with
+        # val-set motion data left in pool slots.
+        if self._using_val and self._orig_all_npz_files is not None:
+            self._motion_library._all_npz_files = self._orig_all_npz_files
+            self._motion_library._load_pool(list(range(self._motion_library.pool_size)))
+            self._orig_all_npz_files = None
+            self._using_val = False
