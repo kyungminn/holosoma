@@ -4,7 +4,7 @@ python src/holosoma/holosoma/train_agent.py \
     logger:wandb \
     --logger.entity draftrec \
     --logger.project holosoma \
-    --logger.name=g1_29dof_amass_future_diverse_action_scale \
+    --logger.name=g1_29dof_amass_future_diverse_action_scale_finetune \
     --logger.video.enabled False \
     --training.checkpoint="logs/holosoma/20260502_g1_29dof_amass_future_diverse_action_scale/model_16000.pt" \
     --training.finetune True \

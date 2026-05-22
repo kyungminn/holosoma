@@ -402,35 +402,36 @@ class MotionCommand(CommandTermBase):
         dof_vel = self.joint_vel[env_ids].clone()
 
         # 2. Adding noise
-        # 2.1 prepare the noise scale
-        dof_pos_noise = self.init_pose_cfg.dof_pos * self.init_pose_cfg.overall_noise_scale  # float
+        # 2.1 prepare the noise scale (zeroed during eval — ASAP parity)
+        noise_scale = 0.0 if self._env.is_evaluating else self.init_pose_cfg.overall_noise_scale
+        dof_pos_noise = self.init_pose_cfg.dof_pos * noise_scale  # float
         root_pos_noise = (
             torch.tensor(
                 self.init_pose_cfg.root_pos,
                 device=self.device,
             )
-            * self.init_pose_cfg.overall_noise_scale
+            * noise_scale
         )  # (3,)
         root_rot_noise_rpy = (
             torch.tensor(
                 self.init_pose_cfg.root_rot,
                 device=self.device,
             )
-            * self.init_pose_cfg.overall_noise_scale
+            * noise_scale
         )  # (3,)
         root_vel_noise = (
             torch.tensor(
                 self.init_pose_cfg.root_lin_vel,
                 device=self.device,
             )
-            * self.init_pose_cfg.overall_noise_scale
+            * noise_scale
         )  # (3,)
         root_ang_vel_noise_rpy = (
             torch.tensor(
                 self.init_pose_cfg.root_ang_vel,
                 device=self.device,
             )
-            * self.init_pose_cfg.overall_noise_scale
+            * noise_scale
         )  # (3,)
 
         # 2.2 Adding noise to dof_pos, root_pos, root_vel, root_ang_vel, root_rot
@@ -1566,23 +1567,24 @@ class MultiMotionCommand(CommandTermBase):
         dof_pos = self.motion_library.joint_pos(mi, ts).clone()
         dof_vel = self.motion_library.joint_vel(mi, ts).clone()
 
-        # Add noise (same logic as MotionCommand)
-        dof_pos_noise = self.init_pose_cfg.dof_pos * self.init_pose_cfg.overall_noise_scale
+        # Add noise (same logic as MotionCommand; zeroed during eval).
+        noise_scale = 0.0 if self._env.is_evaluating else self.init_pose_cfg.overall_noise_scale
+        dof_pos_noise = self.init_pose_cfg.dof_pos * noise_scale
         root_pos_noise = (
             torch.tensor(self.init_pose_cfg.root_pos, device=self.device)
-            * self.init_pose_cfg.overall_noise_scale
+            * noise_scale
         )
         root_rot_noise_rpy = (
             torch.tensor(self.init_pose_cfg.root_rot, device=self.device)
-            * self.init_pose_cfg.overall_noise_scale
+            * noise_scale
         )
         root_vel_noise = (
             torch.tensor(self.init_pose_cfg.root_lin_vel, device=self.device)
-            * self.init_pose_cfg.overall_noise_scale
+            * noise_scale
         )
         root_ang_vel_noise_rpy = (
             torch.tensor(self.init_pose_cfg.root_ang_vel, device=self.device)
-            * self.init_pose_cfg.overall_noise_scale
+            * noise_scale
         )
 
         target_dof_pos = dof_pos + (torch.rand(dof_pos.shape, device=self.device) - 0.5) * 2 * dof_pos_noise

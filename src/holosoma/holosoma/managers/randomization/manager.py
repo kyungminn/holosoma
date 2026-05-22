@@ -215,11 +215,17 @@ class RandomizationManager:
     def reset(self, env_ids) -> None:
         """Run episodic hooks during environment reset.
 
+        Skipped during eval so periodic SR sees the same per-env physics
+        configuration throughout the eval window (ASAP-parity).
+
         Parameters
         ----------
         env_ids : Any
             Environment identifiers selected for reset (matches environment API expectations).
         """
+        if getattr(self.env, "is_evaluating", False):
+            return
+
         for entry in self._class_entries:
             if "reset" in entry["stages"] and entry["name"] not in self._failed_randomizers:
                 entry["instance"].reset(env_ids)
@@ -231,7 +237,14 @@ class RandomizationManager:
                 func(self.env, env_ids, **term_cfg.params)
 
     def step(self) -> None:
-        """Run per-step hooks (if any are configured)."""
+        """Run per-step hooks (if any are configured).
+
+        Skipped during eval so push-robots and similar perturbations don't
+        affect SR measurement (ASAP-parity).
+        """
+        if getattr(self.env, "is_evaluating", False):
+            return
+
         for entry in self._class_entries:
             if "step" in entry["stages"] and entry["name"] not in self._failed_randomizers:
                 entry["instance"].step()
