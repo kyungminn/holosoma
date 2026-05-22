@@ -102,6 +102,17 @@ class EvalOverridesConfig:
     """Use deterministic spawn at tile (0,0) for reproducible evaluation."""
     xy_offset_range: float = 0.0
     """Disable XY offset for deterministic spawn position."""
+    disable_obs_noise: bool = True
+    """Force enable_noise=False on every observation group (ASAP-style eval)."""
+    disable_init_pose_noise: bool = True
+    """Zero out NoiseToInitialPoseConfig.overall_noise_scale on the motion command
+    so reset places the robot exactly at the motion's first frame
+    (ASAP-style; equivalent to ``noise_to_initial_level=0``)."""
+    disable_randomization: bool = True
+    """Drop every randomization term (setup/startup/reset/interval) so eval runs
+    on the nominal-physics environment. ASAP keeps DR during eval, but our
+    reports compare checkpoints under matched conditions and DR randomness
+    inflates variance — disabled by default; override per script if needed."""
 
 
 @dataclass(frozen=True)
@@ -194,6 +205,40 @@ class ExperimentConfig:
             xy_offset_range=self.eval_overrides.xy_offset_range,
         )
 
+        eval_observation = self.observation
+        if self.eval_overrides.disable_obs_noise and self.observation is not None:
+            eval_observation = dataclasses.replace(
+                self.observation,
+                groups={
+                    name: dataclasses.replace(grp, enable_noise=False)
+                    for name, grp in self.observation.groups.items()
+                },
+            )
+
+        eval_randomization = self.randomization
+        if self.eval_overrides.disable_randomization and self.randomization is not None:
+            eval_randomization = dataclasses.replace(
+                self.randomization,
+                setup_terms={},
+                reset_terms={},
+                step_terms={},
+            )
+
+        eval_command = self.command
+        if self.eval_overrides.disable_init_pose_noise and self.command is not None:
+            new_setup_terms = dict(self.command.setup_terms)
+            mc = new_setup_terms.get("motion_command")
+            if mc is not None:
+                motion_config = mc.params.get("motion_config")
+                if motion_config is not None and hasattr(motion_config, "noise_to_initial_pose"):
+                    ntp = motion_config.noise_to_initial_pose
+                    new_ntp = dataclasses.replace(ntp, overall_noise_scale=0.0)
+                    new_motion_config = dataclasses.replace(motion_config, noise_to_initial_pose=new_ntp)
+                    new_params = dict(mc.params)
+                    new_params["motion_config"] = new_motion_config
+                    new_setup_terms["motion_command"] = dataclasses.replace(mc, params=new_params)
+                    eval_command = dataclasses.replace(self.command, setup_terms=new_setup_terms)
+
         return dataclasses.replace(
             self,
             terrain=dataclasses.replace(
@@ -219,6 +264,9 @@ class ExperimentConfig:
                 num_envs=self.eval_overrides.num_envs,
             ),
             logger=holosoma.config_values.logger.disabled if self.eval_overrides.disable_logger else self.logger,
+            observation=eval_observation,
+            randomization=eval_randomization,
+            command=eval_command,
         )
 
     def save_config(self, path: str) -> None:

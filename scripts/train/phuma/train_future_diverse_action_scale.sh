@@ -4,7 +4,7 @@ python src/holosoma/holosoma/train_agent.py \
     logger:wandb \
     --logger.entity draftrec \
     --logger.project holosoma \
-    --logger.name=g1_29dof_phuma_future_diverse_action_scale \
+    --logger.name=g1_29dof_phuma_future_diverse_action_scale_finetune \
     --logger.video.enabled False \
     --command.setup_terms.motion_command.params.motion_config.motion_dir="./g1_npz" \
     --command.setup_terms.motion_command.params.motion_config.split_file="./split/phuma_train.txt" \
