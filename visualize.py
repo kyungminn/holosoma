@@ -43,6 +43,10 @@ def parse_args():
                         help='Camera elevation angle in degrees. Default -20.')
     parser.add_argument('--camera_distance', type=float, default=None,
                         help='Override camera distance (m). Default 4.0 with terrain, 2.2 without.')
+    parser.add_argument('--track_main_pelvis', action='store_true',
+                        help='Force the camera to follow the input robot pelvis even without terrain_npz. '
+                             'Keeps the input robot centered in frame across motions; useful when overlaying '
+                             'a ghost that may drift away from the main robot in world space.')
     return parser.parse_args()
 
 
@@ -424,6 +428,17 @@ def main():
         default_distance = 4.0
         default_azimuth = 90.0  # Side view.
         track_main_pelvis = True
+    elif args.track_main_pelvis:
+        # Drive a FREE camera from the input robot's pelvis. Without terrain
+        # the legacy default is mjCAMERA_TRACKING(body=0), which fixes lookat
+        # at worldbody (origin); when robot+ghost drift far from origin the
+        # framing breaks. FREE + lookat=pelvis keeps the input robot centered
+        # and the ghost's drift is then visible as the ghost moves out of the
+        # robot's overlay.
+        camera.type = mujoco.mjtCamera.mjCAMERA_FREE
+        default_distance = 4.0
+        default_azimuth = 90.0
+        track_main_pelvis = True
     else:
         camera.type = mujoco.mjtCamera.mjCAMERA_TRACKING
         camera.trackbodyid = 0
@@ -457,6 +472,16 @@ def main():
                     renderer.update_scene(data, camera=camera, scene_option=scene_option)
                     pixels = renderer.render()
 
+                    # Also capture main robot depth so we can keep the main
+                    # robot at full opacity when the ghost overlaps it. Without
+                    # this, the alpha blend dims the main robot too whenever
+                    # the ghost sits on top — which is most of the time in the
+                    # OLD/rebased visualization.
+                    renderer.enable_depth_rendering()
+                    renderer.update_scene(data, camera=camera, scene_option=scene_option)
+                    main_depth = renderer.render()
+                    renderer.disable_depth_rendering()
+
                     # Update ghost model + render color and depth.
                     ghost_data.qpos = set_qpos(root_pos=ref_root_pos[i], root_ori=ref_root_ori[i], dof_pos=ref_dof_pos[i])
                     mujoco.mj_forward(ghost_model, ghost_data)
@@ -475,7 +500,23 @@ def main():
                         far_threshold = np.percentile(ghost_depth[finite_depth], 99) * 10.0
                     else:
                         far_threshold = np.inf
-                    ghost_mask = finite_depth & (ghost_depth < far_threshold)
+                    ghost_visible = finite_depth & (ghost_depth < far_threshold)
+
+                    # Determine where main robot is rendered (background pixels
+                    # have infinite/very large depth; geometry pixels are finite).
+                    main_finite = np.isfinite(main_depth) & (main_depth > 0)
+                    if main_finite.any():
+                        main_far_threshold = np.percentile(main_depth[main_finite], 99) * 10.0
+                    else:
+                        main_far_threshold = np.inf
+                    main_visible = main_finite & (main_depth < main_far_threshold)
+
+                    # Ghost only shows where:
+                    #   (a) ghost is visible AND
+                    #   (b) main robot is NOT in front of ghost
+                    #       (i.e. ghost is in front of main, or main isn't here).
+                    main_in_front = main_visible & (main_depth < ghost_depth)
+                    ghost_mask = ghost_visible & ~main_in_front
 
                     combined_pixels = pixels.astype(np.float32).copy()
                     if ghost_mask.any():

@@ -391,22 +391,21 @@ class SuccessRateCallback(RLEvalCallback):
         dof_pos = lib.joint_pos(mi, ts).clone()
         dof_vel = lib.joint_vel(mi, ts).clone()
 
-        # When motions are bound to terrain tiles, env_origins must be re-bound
-        # to match the new motion_indices (otherwise leftover env_origins from
-        # the prior random reset point at the wrong tile, and adding them below
+        # When motions are bound to terrain tiles, rebind env_origins to the
+        # tile matching the sampled motion (otherwise leftover env_origins
         # would put the robot on the wrong staircase).
-        # Body pose data is stored in MOTION-LOCAL frame; the simulator expects
-        # WORLD-frame poses, so we add env_origins after rebinding.
-        # (Mirrors MultiMotionCommand.reset bind_terrain_tiles handling.)
         tile_grid = getattr(mc, "_tile_grid", None)
         if tile_grid is not None:
             n_rows, _, _ = tile_grid.shape
-            # Use row 0 deterministically (eval should be reproducible).
             row_idx = torch.zeros(self._num_envs, dtype=torch.long, device=self.device)
             col_idx = mc.motion_indices  # (num_envs,) in [0, n_cols)
             new_origins = tile_grid[row_idx, col_idx]  # (num_envs, 3)
             env.simulator.scene.env_origins[:] = new_origins
-            root_pos = root_pos + new_origins
+
+        # Body pose data is motion-local; place robot at env world frame so it
+        # matches ref_pos_w / body_pos_w (which add env_origins). Without this,
+        # tracking error = ||env_origins|| and every env fails.
+        root_pos = root_pos + env.simulator.scene.env_origins
 
         # Apply the training-time init_root_offset (e.g. +10 cm Z lift) so
         # the foot collision mesh doesn't penetrate the contact plane at
@@ -449,14 +448,13 @@ class SuccessRateCallback(RLEvalCallback):
         env.time_out_buf[:] = 0
 
     def _check_motion_far(self) -> dict[float, torch.Tensor]:
-        """Root-only check: 3D position error of the reference body (pelvis)
-        between motion target and the robot exceeds threshold.
+        """Pelvis world-frame check, mirroring main's BadTracking.bad_ref_pos.
 
-        This replaces the ASAP-style ``max over all tracked bodies`` rule.
-        Tracking failures on hands / arms / head — common when the policy is
-        only meant to follow the locomotion goal — no longer count as full
-        motion failures; the success criterion is purely "did the root stay
-        within ``threshold`` of the commanded root trajectory?".
+        Mainline (and the restored z-3D BadTracking here) terminates training
+        when ``||ref_pos_w - robot_ref_pos_w||`` exceeds the threshold; SR
+        should measure the same quantity so an "alive" robot is also a
+        "successful" robot. This catches global xy drift (the symptom the
+        kyungminn z-only relaxation was hiding).
 
         Returns dict of threshold -> (num_envs,) bool tensor.
         """

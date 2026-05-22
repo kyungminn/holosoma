@@ -9,6 +9,7 @@ python src/holosoma/holosoma/train_agent.py \
     --logger.video.enabled False \
     --algo.config.load_optimizer False \
     --algo.config.empirical_normalization=True \
+    --algo.config.eval_callbacks.success_rate.val_split_file=./split/phuma_val.txt \
     --command.setup_terms.motion_command.params.motion_config.motion_dir="./g1_npz/PHUMA_processed" \
     --command.setup_terms.motion_command.params.motion_config.split_file="./split/phuma_train.txt" \
     robot:g1-29dof-diverse-action-scale

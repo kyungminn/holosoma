@@ -585,11 +585,10 @@ class MotionCommand(CommandTermBase):
 
     @property
     def body_pos_w(self) -> torch.Tensor:
-        # MotionCommand (single-motion) does not bind to terrain tiles; keep
-        # motion data in env-local frame to match robot_body_pos_w. Adding
-        # env_origins here would break body_pos_relative_w (which subtracts
-        # ref_pos_w from body_pos_w; both must be in the same frame).
-        return self.motion.body_pos_w[self.time_steps][:, self.tracked_body_indexes]
+        return (
+            self.motion.body_pos_w[self.time_steps][:, self.tracked_body_indexes]
+            + self._env.simulator.scene.env_origins[:, None, :]
+        )
 
     @property
     def body_quat_w(self) -> torch.Tensor:
@@ -605,13 +604,7 @@ class MotionCommand(CommandTermBase):
 
     @property
     def ref_pos_w(self) -> torch.Tensor:
-        # MotionCommand (single-motion) does not bind to terrain tiles; the robot
-        # is placed at motion-local coordinates in env-local space (see reset()),
-        # so ref must stay in env-local frame too. Adding env_origins here would
-        # introduce a constant ~‖env_origins‖ offset that the
-        # motion_global_ref_position_error_exp reward and SuccessRate eval
-        # interpret as catastrophic tracking failure.
-        return self.motion.body_pos_w[self.time_steps, self.ref_body_index]
+        return self.motion.body_pos_w[self.time_steps, self.ref_body_index] + self._env.simulator.scene.env_origins
 
     @property
     def ref_quat_w(self) -> torch.Tensor:
@@ -619,7 +612,7 @@ class MotionCommand(CommandTermBase):
 
     @property
     def root_pos_w(self) -> torch.Tensor:
-        return self.motion.body_pos_w[self.time_steps, 0]
+        return self.motion.body_pos_w[self.time_steps, 0] + self._env.simulator.scene.env_origins
 
     @property
     def root_quat_w(self) -> torch.Tensor:
@@ -1606,13 +1599,14 @@ class MultiMotionCommand(CommandTermBase):
         )
         target_root_pos = target_root_pos + init_root_offset
 
-        # When binding motions to terrain tiles, place the robot on the correct
-        # tile by adding the env_origin of that tile. Without this, the robot
-        # lands at motion-frame coordinates but ref_pos_w lives in tile coords.
-        if self._tile_grid is not None:
-            target_root_pos = (
-                target_root_pos + self._env.simulator.scene.env_origins[env_ids]
-            )
+        # Place robot at env world frame. motion_library.body_pos_w returns
+        # motion-local (root near origin); ref_pos_w / body_pos_w properties
+        # add env_origins for world frame. Robot must land in same frame so
+        # add env_origins unconditionally (tile_grid path already rebound
+        # env_origins to the correct tile above).
+        target_root_pos = (
+            target_root_pos + self._env.simulator.scene.env_origins[env_ids]
+        )
 
         rand_sample_rpy = (torch.rand((n, 3), device=self.device) - 0.5) * 2 * root_rot_noise_rpy
         orientations_delta = quat_from_euler_xyz(
@@ -1699,15 +1693,10 @@ class MultiMotionCommand(CommandTermBase):
 
     @property
     def body_pos_w(self) -> torch.Tensor:
-        # env_origins is added only in tile-bound mode (mirrors ref_pos_w /
-        # root_pos_w). For flat-plane multi-motion, motion data stays in
-        # env-local frame so that body_pos_relative_w (which subtracts
-        # ref_pos_w from body_pos_w) keeps both sides in the same frame and
-        # produces a sensible tracking error against robot_body_pos_w.
-        bp = self.motion_library.body_pos_w(self.motion_indices, self.time_steps)[:, self.tracked_body_indexes]
-        if self._tile_grid is not None:
-            bp = bp + self._env.simulator.scene.env_origins[:, None, :]
-        return bp
+        return (
+            self.motion_library.body_pos_w(self.motion_indices, self.time_steps)[:, self.tracked_body_indexes]
+            + self._env.simulator.scene.env_origins[:, None, :]
+        )
 
     @property
     def body_quat_w(self) -> torch.Tensor:
@@ -1723,17 +1712,8 @@ class MultiMotionCommand(CommandTermBase):
 
     @property
     def ref_pos_w(self) -> torch.Tensor:
-        # env_origins is added only when motions are bound to terrain tiles
-        # (where the per-env tile origin IS the physics world offset, mirrored
-        # by reset() adding env_origins to robot placement). For flat-plane
-        # multi-motion (no tile binding) the robot is placed in env-local
-        # coordinates without env_origins, so ref must stay in the same frame
-        # to keep motion_global_ref_position_error_exp and SuccessRate sane.
         all_body_pos = self.motion_library.body_pos_w(self.motion_indices, self.time_steps)
-        ref = all_body_pos[:, self.ref_body_index]
-        if self._tile_grid is not None:
-            ref = ref + self._env.simulator.scene.env_origins
-        return ref
+        return all_body_pos[:, self.ref_body_index] + self._env.simulator.scene.env_origins
 
     @property
     def ref_quat_w(self) -> torch.Tensor:
@@ -1743,10 +1723,7 @@ class MultiMotionCommand(CommandTermBase):
     @property
     def root_pos_w(self) -> torch.Tensor:
         all_body_pos = self.motion_library.body_pos_w(self.motion_indices, self.time_steps)
-        root = all_body_pos[:, 0]
-        if self._tile_grid is not None:
-            root = root + self._env.simulator.scene.env_origins
-        return root
+        return all_body_pos[:, 0] + self._env.simulator.scene.env_origins
 
     @property
     def root_quat_w(self) -> torch.Tensor:
