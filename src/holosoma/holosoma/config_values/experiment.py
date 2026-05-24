@@ -28,6 +28,7 @@ from holosoma.config_values.wbt.g1.multi_motion_experiment import (
     g1_29dof_phuma,
     g1_29dof_phuma_future_motion,
 )
+from holosoma.config_values.wbt.g1.phuma_rfi_experiment import g1_29dof_phuma_future_motion_rfi
 from holosoma.config_values.wbt.g1.phuma_tuned_experiment import g1_29dof_phuma_future_motion_tuned
 
 DEFAULTS = {
@@ -57,6 +58,7 @@ DEFAULTS = {
     "g1_29dof_phuma": g1_29dof_phuma,
     "g1_29dof_phuma_future_motion": g1_29dof_phuma_future_motion,
     "g1_29dof_phuma_future_motion_tuned": g1_29dof_phuma_future_motion_tuned,
+    "g1_29dof_phuma_future_motion_rfi": g1_29dof_phuma_future_motion_rfi,
 }
 
 AnnotatedExperimentConfig = Annotated[

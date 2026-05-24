@@ -141,4 +141,48 @@ g1_29dof_wbt_randomization_w_object = RandomizationManagerCfg(
     },
 )
 
-__all__ = ["g1_29dof_wbt_randomization", "g1_29dof_wbt_randomization_w_object"]
+# PBHC-style RFI domain randomization: inject uniform torque noise scaled by
+# torque_limits with per-env per-dof random scale.
+#   - setup_torque_rfi: turns ON noise injection with base rfi_lim=0.1
+#   - actuator_randomizer_state.enable_rfi_lim=True with [0.5, 1.5] range:
+#     per-env scaling of rfi_lim across episodes
+#   - configure_torque_rfi (reset): persists flag/limit across resets
+_rfi_setup_terms = {
+    **base_setup_terms,
+    "actuator_randomizer_state": RandomizationTermCfg(
+        func="holosoma.managers.randomization.terms.locomotion:ActuatorRandomizerState",
+        params={
+            "kp_range": [0.9, 1.1],
+            "kd_range": [0.9, 1.1],
+            "rfi_lim_range": [0.5, 1.5],
+            "enable_pd_gain": True,
+            "enable_rfi_lim": True,
+        },
+    ),
+    "setup_torque_rfi": RandomizationTermCfg(
+        func="holosoma.managers.randomization.terms.locomotion:setup_torque_rfi",
+        params={
+            "enabled": True,
+            "rfi_lim": 0.1,
+        },
+    ),
+}
+
+_rfi_reset_terms = {
+    **base_reset_terms,
+    "configure_torque_rfi": RandomizationTermCfg(
+        func="holosoma.managers.randomization.terms.locomotion:configure_torque_rfi",
+    ),
+}
+
+g1_29dof_wbt_randomization_with_rfi = RandomizationManagerCfg(
+    setup_terms=_rfi_setup_terms,
+    reset_terms=_rfi_reset_terms,
+    step_terms={**base_step_terms},
+)
+
+__all__ = [
+    "g1_29dof_wbt_randomization",
+    "g1_29dof_wbt_randomization_w_object",
+    "g1_29dof_wbt_randomization_with_rfi",
+]
