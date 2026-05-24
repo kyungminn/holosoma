@@ -39,8 +39,8 @@ NOT applied (intentional):
       simulate per-robot encoder calibration drift.
     * motion_ends termination is left ON. This branch pairs it with a
       default-pose handoff at motion end and depends on it.
-    * BadTracking termination is unchanged (this branch's BadTracking is
-      already z-axis-only, matching upstream's BadTrackingZOnly behavior).
+    * BadTracking termination is unchanged (pelvis 3D-norm + multi-body
+      ankle/wrist, matching main).
 """
 
 from dataclasses import replace
@@ -69,7 +69,28 @@ class _SuccessRateCbValConfig:
     max_eval_motions: int = 0  # 0 = no cap; >0 caps eval to first N motions (quick verification)
 
 
-_eval_callbacks_val = {"success_rate": _SuccessRateCbValConfig()}
+@pydantic_dataclass(frozen=True)
+class _MotionMetricsCbValConfig:
+    """Eval callback config: runs MotionMetricsCallback alongside SuccessRate.
+
+    Auto-discovers the SuccessRateCallback from training_loop.eval_callbacks
+    at on_pre_evaluate_policy time, so the two callbacks share batch
+    bookkeeping. Outputs g-mpjpe / l-mpjpe / vel_err / accel_err (mm, ASAP
+    convention) per eval iteration as ``motion_metrics_iter{N:05d}.txt``.
+    """
+
+    _target_: str = "holosoma.agents.callbacks.motion_metrics_callback.MotionMetricsCallback"
+    val_split_file: str = "./split/phuma_val.txt"
+    val_motion_dir: str = ""
+    max_eval_motions: int = 0
+
+
+# IMPORTANT: SR callback is registered first; MotionMetrics auto-discovers it
+# from the live eval_callbacks list during on_pre_evaluate_policy.
+_eval_callbacks_val = {
+    "success_rate": _SuccessRateCbValConfig(),
+    "motion_metrics": _MotionMetricsCbValConfig(),
+}
 
 _init_pose_config_tuned = NoiseToInitialPoseConfig(
     overall_noise_scale=1.0,

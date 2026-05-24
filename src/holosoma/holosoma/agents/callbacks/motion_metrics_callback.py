@@ -1,20 +1,25 @@
 """Motion tracking metric evaluation callback.
 
-Accumulates per-env per-step body position / joint vel / joint accel errors
-during the existing batched eval rollout (see eval_success_rate.py) and
-writes a summary text report mirroring success_rate_iter{N:05d}.txt.
+Accumulates per-env per-step body position / vel / accel errors during the
+existing batched eval rollout (see eval_success_rate.py) and writes a summary
+text report alongside success_rate_iter{N:05d}.txt.
 
-Designed to coexist with SuccessRateCallback: both share the same
-batched rollout. SuccessRateCallback owns batch setup / stop control;
-this callback only observes state and accumulates.
+Designed to coexist with SuccessRateCallback: both share the same batched
+rollout. SuccessRateCallback owns batch setup / stop control; this callback
+only observes state and accumulates. The SuccessRate callback is auto-
+discovered from ``training_loop.eval_callbacks`` so this callback works
+both as part of training-time eval (dict config) and as a manual add-on
+in standalone scripts.
 
-Metrics reported:
-  - l-mpjpe (mm): root-relative per-body position error, averaged across
-    the env's alive frames, then across motions. Source: motion_command's
-    pre-computed `metrics["motion/error_body_pos"]` (already root-frame-
-    aligned via body_pos_relative_w).
-  - dof_vel_err (rad/s): mean over alive frames of ||vel_actual - vel_gt||_2.
-  - dof_acc_err (rad/s^2): finite-differenced from dof_vel_err with dt=1/rl_rate.
+Metrics reported (ASAP convention: vel/accel are body-pos finite differences
+in mm, no dt division):
+  - g-mpjpe (mm): per-body world-frame position error (no root alignment).
+    Captures BOTH joint-tracking error AND root drift.
+  - l-mpjpe (mm): per-body root-relative position error (mc.body_pos_relative_w
+    aligns motion to robot's torso XY+yaw, preserves Z and tilt). Captures
+    body-pose tracking quality independent of root drift.
+  - vel_err   (mm): || (pred[t]-pred[t-1]) - (gt[t]-gt[t-1]) ||, per body.
+  - accel_err (mm): || pred[t-2]-2pred[t-1]+pred[t] - (same for gt) ||, per body.
 """
 
 from __future__ import annotations
@@ -131,6 +136,16 @@ class MotionMetricsCallback(RLEvalCallback):
         self._motion_command = mc
         self._motion_library = mc.motion_library
 
+        # Auto-discover SuccessRateCallback if not explicitly attached. This
+        # allows the same callback to be used at training time (config dict
+        # registers both callbacks alongside each other) without extra wiring.
+        if self._sr_callback is None and getattr(self.training_loop, "eval_callbacks", None):
+            from holosoma.agents.callbacks.success_rate_callback import SuccessRateCallback
+            for cb in self.training_loop.eval_callbacks:
+                if isinstance(cb, SuccessRateCallback):
+                    self._sr_callback = cb
+                    break
+
         # Prefer SR callback's view of eval set (if attached) — it has already
         # swapped the motion_library's file list to the eval set at this point.
         if self._sr_callback is not None and getattr(self._sr_callback, "_motion_library", None) is mc.motion_library:
@@ -159,9 +174,11 @@ class MotionMetricsCallback(RLEvalCallback):
         # for splits larger than num_envs, where SuccessRateCallback iterates
         # multiple batches and the same env_id evaluates different motions in
         # successive batches.
-        # All three metrics use body positions (root-relative pos for l-mpjpe,
-        # world-frame pos for ASAP-style vel/accel finite differences).
+        # Position metrics: g-mpjpe (world frame, includes root drift) and
+        # l-mpjpe (root-aligned, body-pose only). Vel/accel: world-frame body
+        # position finite differences.
         num_bodies = len(mc.motion_cfg.body_names_to_track)
+        self._sum_body_err_global_mm = torch.zeros(self._num_motions, num_bodies, device=self.device)
         self._sum_body_err_mm = torch.zeros(self._num_motions, num_bodies, device=self.device)
         self._sum_vel_err_mm = torch.zeros(self._num_motions, num_bodies, device=self.device)
         self._sum_accel_err_mm = torch.zeros(self._num_motions, num_bodies, device=self.device)
@@ -230,20 +247,27 @@ class MotionMetricsCallback(RLEvalCallback):
             env_done = torch.zeros(batch_size, dtype=torch.bool, device=self.device)
         active = ~env_done  # [batch_size]
 
-        # Per-body root-relative position error in mm (l-mpjpe).
-        body_err_mm = (
-            torch.norm(mc.body_pos_relative_w - mc.robot_body_pos_w, dim=-1) * 1000.0
-        )[:batch_size]  # [batch_size, B]
-
-        # Current frame's body positions in world frame, for vel/accel finite-diff.
+        # Current frame's body positions in world frame, for vel/accel finite-diff
+        # AND for g-mpjpe (world-frame per-body position error).
         # Both have env_origins added → cancel in finite differences.
         curr_body_pos_pred = mc.robot_body_pos_w[:batch_size]  # [batch_size, B, 3]
         curr_body_pos_gt = mc.body_pos_w[:batch_size]          # [batch_size, B, 3]
 
-        # --- Position error (l-mpjpe) accumulation ---
+        # g-mpjpe: world-frame per-body position error (no root alignment).
+        # Captures root drift AND body-pose error together.
+        body_err_global_mm = torch.norm(curr_body_pos_pred - curr_body_pos_gt, dim=-1) * 1000.0  # [B, B]
+
+        # l-mpjpe: root-relative per-body position error (motion aligned to robot
+        # torso XY+yaw, Z and tilt preserved). Captures body-pose error only.
+        body_err_mm = (
+            torch.norm(mc.body_pos_relative_w - mc.robot_body_pos_w, dim=-1) * 1000.0
+        )[:batch_size]  # [batch_size, B]
+
+        # --- Position error (g-mpjpe + l-mpjpe) accumulation ---
         active_env_ids = active.nonzero(as_tuple=True)[0]  # [K]
         if active_env_ids.numel() > 0:
             motion_ids = active_env_ids + batch_start
+            self._sum_body_err_global_mm.index_add_(0, motion_ids, body_err_global_mm[active_env_ids])
             self._sum_body_err_mm.index_add_(0, motion_ids, body_err_mm[active_env_ids])
             self._step_count.index_add_(
                 0, motion_ids, torch.ones_like(motion_ids, dtype=self._step_count.dtype)
@@ -318,31 +342,37 @@ class MotionMetricsCallback(RLEvalCallback):
         vcnt = self._vel_count.clamp(min=1).to(torch.float32)
         acnt = self._accel_count.clamp(min=1).to(torch.float32)
 
-        per_motion_per_body_mpjpe = self._sum_body_err_mm / cnt[:, None]   # [num_motions, B] mm
-        per_motion_per_body_vel   = self._sum_vel_err_mm / vcnt[:, None]   # [num_motions, B] mm
-        per_motion_per_body_accel = self._sum_accel_err_mm / acnt[:, None] # [num_motions, B] mm
+        per_motion_per_body_gmpjpe = self._sum_body_err_global_mm / cnt[:, None]  # [num_motions, B] mm
+        per_motion_per_body_mpjpe  = self._sum_body_err_mm / cnt[:, None]
+        per_motion_per_body_vel    = self._sum_vel_err_mm / vcnt[:, None]
+        per_motion_per_body_accel  = self._sum_accel_err_mm / acnt[:, None]
 
         # Motions that were never sampled OR whose accumulator got poisoned with
         # NaN (e.g. physics blow-up made body positions NaN) → set per-motion
         # values to NaN, then use nanmean throughout so corrupt motions don't
         # poison aggregate metrics.
         unsampled = self._step_count == 0
+        nan_gbody = torch.isnan(per_motion_per_body_gmpjpe).any(dim=-1)
         nan_body = torch.isnan(per_motion_per_body_mpjpe).any(dim=-1)
         nan_vel = torch.isnan(per_motion_per_body_vel).any(dim=-1)
         nan_acc = torch.isnan(per_motion_per_body_accel).any(dim=-1)
-        broken = unsampled | nan_body | nan_vel | nan_acc
+        broken = unsampled | nan_gbody | nan_body | nan_vel | nan_acc
         if broken.any():
+            per_motion_per_body_gmpjpe[broken] = float("nan")
             per_motion_per_body_mpjpe[broken] = float("nan")
             per_motion_per_body_vel[broken] = float("nan")
             per_motion_per_body_accel[broken] = float("nan")
 
-        per_motion_mpjpe = per_motion_per_body_mpjpe.mean(dim=-1)        # [num_motions]
-        per_motion_vel   = per_motion_per_body_vel.mean(dim=-1)
-        per_motion_acc   = per_motion_per_body_accel.mean(dim=-1)
-        per_body_mpjpe = torch.nanmean(per_motion_per_body_mpjpe, dim=0)  # [B]
-        overall_mpjpe = float(torch.nanmean(per_motion_mpjpe).item())
-        overall_vel   = float(torch.nanmean(per_motion_vel).item())
-        overall_acc   = float(torch.nanmean(per_motion_acc).item())
+        per_motion_gmpjpe = per_motion_per_body_gmpjpe.mean(dim=-1)
+        per_motion_mpjpe  = per_motion_per_body_mpjpe.mean(dim=-1)
+        per_motion_vel    = per_motion_per_body_vel.mean(dim=-1)
+        per_motion_acc    = per_motion_per_body_accel.mean(dim=-1)
+        per_body_gmpjpe = torch.nanmean(per_motion_per_body_gmpjpe, dim=0)
+        per_body_mpjpe  = torch.nanmean(per_motion_per_body_mpjpe, dim=0)
+        overall_gmpjpe = float(torch.nanmean(per_motion_gmpjpe).item())
+        overall_mpjpe  = float(torch.nanmean(per_motion_mpjpe).item())
+        overall_vel    = float(torch.nanmean(per_motion_vel).item())
+        overall_acc    = float(torch.nanmean(per_motion_acc).item())
 
         num_broken = int(broken.sum().item())
         num_unsampled = int(unsampled.sum().item())
@@ -351,18 +381,22 @@ class MotionMetricsCallback(RLEvalCallback):
         # ASAP convention: vel/accel are body-pos finite differences in mm (no dt division),
         # not true physical units.
         self.metrics = {
+            "MotionMetrics/g_mpjpe_mm": overall_gmpjpe,
             "MotionMetrics/l_mpjpe_mm": overall_mpjpe,
             "MotionMetrics/vel_err_mm": overall_vel,
             "MotionMetrics/accel_err_mm": overall_acc,
             "MotionMetrics/num_motions": float(num_total),
         }
+        for name, val in zip(self._tracked_body_names, per_body_gmpjpe.tolist()):
+            self.metrics[f"MotionMetrics/g_body_mpjpe_mm/{name}"] = float(val)
         for name, val in zip(self._tracked_body_names, per_body_mpjpe.tolist()):
-            self.metrics[f"MotionMetrics/body_mpjpe_mm/{name}"] = float(val)
+            self.metrics[f"MotionMetrics/l_body_mpjpe_mm/{name}"] = float(val)
 
         logger.info("=" * 60)
         logger.info("=== Motion Metrics Eval Results (ASAP convention) ===")
         logger.info("=" * 60)
-        logger.info(f"  l-mpjpe   (mean over motions):     {overall_mpjpe:.3f} mm")
+        logger.info(f"  g-mpjpe   (mean over motions):     {overall_gmpjpe:.3f} mm  (world frame, includes root drift)")
+        logger.info(f"  l-mpjpe   (mean over motions):     {overall_mpjpe:.3f} mm  (root-aligned)")
         logger.info(f"  vel_err   (mean over motions):     {overall_vel:.3f} mm  (1st-order body pos diff)")
         logger.info(f"  accel_err (mean over motions):     {overall_acc:.3f} mm  (2nd-order body pos diff)")
 
@@ -385,13 +419,16 @@ class MotionMetricsCallback(RLEvalCallback):
                 )
             lines.append("")
             lines.append("Overall (ASAP convention; vel/accel are body-pos finite diffs in mm, no dt division):")
-            lines.append(f"  l-mpjpe   (mean over motions): {overall_mpjpe:.3f} mm")
+            lines.append(f"  g-mpjpe   (mean over motions): {overall_gmpjpe:.3f} mm  (world frame, includes root drift)")
+            lines.append(f"  l-mpjpe   (mean over motions): {overall_mpjpe:.3f} mm  (root-aligned)")
             lines.append(f"  vel_err   (mean over motions): {overall_vel:.3f} mm  (1st-order body-pos diff)")
             lines.append(f"  accel_err (mean over motions): {overall_acc:.3f} mm  (2nd-order body-pos diff)")
             lines.append("")
-            lines.append("--- Per-Body l-mpjpe (mm) ---")
-            for name, val in zip(self._tracked_body_names, per_body_mpjpe.tolist()):
-                lines.append(f"  {name:30s} {val:8.3f}")
+            lines.append("--- Per-Body g-mpjpe / l-mpjpe (mm) ---")
+            for name, gval, lval in zip(self._tracked_body_names,
+                                        per_body_gmpjpe.tolist(),
+                                        per_body_mpjpe.tolist()):
+                lines.append(f"  {name:30s} g={gval:8.3f}   l={lval:8.3f}")
             lines.append("")
 
             if self._motion_skill:
@@ -408,15 +445,16 @@ class MotionMetricsCallback(RLEvalCallback):
                         cat_groups[ca].append(i)
 
                 def _group_report(groups, label):
-                    out = [f"--- Per-{label} l-mpjpe / vel / accel (all mm, ASAP) ---"]
+                    out = [f"--- Per-{label} g-mpjpe / l-mpjpe / vel / accel (all mm, ASAP) ---"]
                     for k in sorted(groups.keys()):
                         idxs = torch.tensor(groups[k], dtype=torch.long, device=self.device)
                         # nanmean to skip unsampled motions
-                        mp = float(torch.nanmean(per_motion_mpjpe[idxs]).item())
-                        ve = float(torch.nanmean(per_motion_vel[idxs]).item())
-                        ac = float(torch.nanmean(per_motion_acc[idxs]).item())
+                        gmp = float(torch.nanmean(per_motion_gmpjpe[idxs]).item())
+                        lmp = float(torch.nanmean(per_motion_mpjpe[idxs]).item())
+                        ve  = float(torch.nanmean(per_motion_vel[idxs]).item())
+                        ac  = float(torch.nanmean(per_motion_acc[idxs]).item())
                         out.append(
-                            f"  {k:20s} mpjpe={mp:7.2f}  vel={ve:6.3f}  accel={ac:6.3f}  (n={len(groups[k])})"
+                            f"  {k:20s} g={gmp:7.2f}  l={lmp:7.2f}  vel={ve:6.3f}  accel={ac:6.3f}  (n={len(groups[k])})"
                         )
                     out.append("")
                     return out
@@ -425,13 +463,14 @@ class MotionMetricsCallback(RLEvalCallback):
                 lines.extend(_group_report(cat_groups, "Category"))
 
             lines.append("--- Per-Motion (all mm, ASAP convention) ---")
+            gmp_list = per_motion_gmpjpe.tolist()
             mp_list = per_motion_mpjpe.tolist()
             ve_list = per_motion_vel.tolist()
             ac_list = per_motion_acc.tolist()
             sc_list = self._step_count[:num_total].tolist()
             for i in range(num_total):
                 lines.append(
-                    f"  mpjpe={mp_list[i]:7.2f}  vel={ve_list[i]:6.3f}  accel={ac_list[i]:6.3f}  steps={sc_list[i]:4d}  {lib._all_npz_files[i]}"
+                    f"  g={gmp_list[i]:7.2f}  l={mp_list[i]:7.2f}  vel={ve_list[i]:6.3f}  accel={ac_list[i]:6.3f}  steps={sc_list[i]:4d}  {lib._all_npz_files[i]}"
                 )
 
             with open(txt_path, "w") as f:
