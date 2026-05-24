@@ -204,6 +204,15 @@ class SuccessRateCallback(RLEvalCallback):
             new_origins = tile_grid[row_idx, col_idx]  # (num_envs, 3)
             env.simulator.scene.env_origins[:] = new_origins
             root_pos = root_pos + new_origins
+        else:
+            # No tile binding: still need to add env_origins so the robot is
+            # placed in the same world frame as `mc.ref_pos_w` / `mc.body_pos_w`
+            # (both of which add env_origins). Without this, the SR motion-far
+            # check sees ||ref_pos_w - robot_ref_pos_w|| == ||env_origins||,
+            # which exceeds the 0.5 m threshold whenever env_origins are
+            # non-zero (e.g. multi-env mujoco setup with 4 m grid spacing) and
+            # every env gets marked failed on the first step.
+            root_pos = root_pos + env.simulator.scene.env_origins
 
         # Apply the training-time init_root_offset (e.g. +10 cm Z lift) so
         # the foot collision mesh doesn't penetrate the contact plane at

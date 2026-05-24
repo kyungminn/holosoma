@@ -134,7 +134,8 @@ class MotionMetricsCallback(RLEvalCallback):
         # Prefer SR callback's view of eval set (if attached) — it has already
         # swapped the motion_library's file list to the eval set at this point.
         if self._sr_callback is not None and getattr(self._sr_callback, "_motion_library", None) is mc.motion_library:
-            self._using_val = self._sr_callback._using_val
+            # Older SR callback versions don't expose `_using_val` — fall back to False.
+            self._using_val = bool(getattr(self._sr_callback, "_using_val", False))
             num_motions = self._sr_callback._num_motions
             split_file = self._val_split_file or getattr(mc.motion_cfg, "split_file", "")
         else:
