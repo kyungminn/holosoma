@@ -810,7 +810,7 @@ class WholeBodyTrackingPolicy(BasePolicy):
             # the full motion playback window. _handle_stop_policy also calls this
             # but only fires when the user actually stops; the natural-end case
             # needs its own trigger.
-            self._save_metrics()
+            self._save_metrics(motion_completed=True)
             # Keep `motion_clip_progressing=True` so rl_inference does not reset
             # motion_timestep back to 0. Set a flag to stop clock-driven advance.
             self._motion_held_at_end = True
@@ -1119,8 +1119,15 @@ class WholeBodyTrackingPolicy(BasePolicy):
         next_num = (max(existing_nums) + 1) if existing_nums else 1
         return str(base_dir / f"{motion_name}_run{next_num:02d}.npz")
 
-    def _save_metrics(self):
-        """Compute l-mpjpe / joint-vel / joint-accel errors and dump to npz."""
+    def _save_metrics(self, motion_completed: bool = False):
+        """Compute l-mpjpe / joint-vel / joint-accel errors and dump to npz.
+
+        Args:
+            motion_completed: True when invoked from the natural-end save trigger
+                (``_motion_finished`` path in policy_action); False when invoked
+                from ``_handle_stop_policy`` after a user stop press / mid-motion
+                abort. Saved into the npz so downstream analysis can distinguish.
+        """
         if not self.save_metrics or self._metrics_saved:
             return
         buf = self._metric_buffer
@@ -1183,6 +1190,18 @@ class WholeBodyTrackingPolicy(BasePolicy):
 
         body_names = list(self.pinocchio_robot.tracked_body_names)
 
+        # Success indicators based on per-step body tracking.
+        # We use the per-step MEAN over bodies of l-mpjpe (root-aligned, mm) as
+        # the indicator: if it ever exceeds the threshold, mark as failed.
+        # Mirrors the SR-callback convention (per-step body-error threshold), but
+        # adapted for inference-time root-aligned metrics (since the real-robot
+        # interface doesn't expose absolute root world position).
+        per_step_mean_l_mpjpe_mm = per_body_err_mm.mean(axis=1)              # [T]
+        max_per_step_mean_l_mpjpe_mm = float(per_step_mean_l_mpjpe_mm.max())
+        success_0_5m  = bool(max_per_step_mean_l_mpjpe_mm < 500.0)
+        success_0_25m = bool(max_per_step_mean_l_mpjpe_mm < 250.0)
+        success_0_15m = bool(max_per_step_mean_l_mpjpe_mm < 150.0)
+
         save_path = self.metric_save_path
         if save_path is None:
             save_path = self._resolve_default_save_path()
@@ -1211,11 +1230,25 @@ class WholeBodyTrackingPolicy(BasePolicy):
             dof_acc_err_mean=np.float32(acc_err_mean),
             tracked_body_names=np.array(body_names),
             rl_rate=np.float32(self.config.task.rl_rate),
+            # Success indicators
+            motion_completed=np.bool_(motion_completed),
+            success_0_5m=np.bool_(success_0_5m),
+            success_0_25m=np.bool_(success_0_25m),
+            success_0_15m=np.bool_(success_0_15m),
+            max_per_step_mean_l_mpjpe_mm=np.float32(max_per_step_mean_l_mpjpe_mm),
         )
         self._metrics_saved = True
+        completed_tag = "completed" if motion_completed else "stopped early"
+        success_tag = (
+            f"0.5m={'OK' if success_0_5m else 'FAIL'}  "
+            f"0.25m={'OK' if success_0_25m else 'FAIL'}  "
+            f"0.15m={'OK' if success_0_15m else 'FAIL'}"
+        )
         self.logger.info(
             colored(
                 f"[metrics] Saved {len(ts)} steps to {save_path} | "
+                f"motion={completed_tag} | success {success_tag} | "
+                f"max-per-step mean l-mpjpe={max_per_step_mean_l_mpjpe_mm:.1f} mm | "
                 f"l-mpjpe(mean)={l_mpjpe_mean_mm:.2f} mm | "
                 f"vel_err(mean)={vel_err_mean:.3f} rad/s | "
                 f"acc_err(mean)={acc_err_mean:.2f} rad/s² ",
@@ -1298,8 +1331,10 @@ class WholeBodyTrackingPolicy(BasePolicy):
             )
             return
 
-        # Persist metrics before tearing down motion state.
-        self._save_metrics()
+        # Persist metrics before tearing down motion state. If natural-end save
+        # already fired (`_metrics_saved=True`), this is a no-op; otherwise the
+        # user stopped before the motion completed → motion_completed=False.
+        self._save_metrics(motion_completed=False)
 
         self.use_policy_action = False
         self.get_ready_state = False
