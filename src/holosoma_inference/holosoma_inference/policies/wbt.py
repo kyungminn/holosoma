@@ -1058,13 +1058,18 @@ class WholeBodyTrackingPolicy(BasePolicy):
 
     def _resolve_default_save_path(self) -> str:
         """Auto-derive save path:
-            ./sim_to_{sim,real}_log_metrics/{dataset}/{category}/{motion}_runNN.npz
+            ./sim_to_{sim,real}_log_metrics/{dataset}/{category}/{skill}/{motion}_runNN.npz
 
         - sim_mode: 'sim_to_sim' if use_sim_time else 'sim_to_real'
         - dataset:  'phuma' / 'amass' / 'unknown' (detected from model_path substring)
-        - category: motion_file_path's parent dir name, lowercased
+        - category: motion_file_path's grandparent dir name (lowercased)
+        - skill:    motion_file_path's parent dir name (lowercased)
         - motion:   motion_file_path filename stem
         - runNN:    smallest unused 2-digit run number (01, 02, ...)
+
+        For motions without a skill subdirectory (parent has only 1 dir level),
+        category is the parent dir name and skill defaults to 'misc' so the
+        layout stays uniformly 4-deep.
         """
         root_dir = "sim_to_sim_log_metrics" if self.use_sim_time else "sim_to_real_log_metrics"
 
@@ -1083,13 +1088,23 @@ class WholeBodyTrackingPolicy(BasePolicy):
         motion_file_path = self.config.task.motion_file_path
         if motion_file_path is None:
             category = "unknown"
+            skill = "misc"
             motion_name = "unknown_motion"
         else:
             motion_path = Path(motion_file_path)
-            category = (motion_path.parent.name or "misc").lower()
+            parents = motion_path.parts[:-1]
+            if len(parents) >= 2:
+                category = (parents[-2] or "misc").lower()
+                skill = (parents[-1] or "misc").lower()
+            elif len(parents) == 1:
+                category = (parents[-1] or "misc").lower()
+                skill = "misc"
+            else:
+                category = "unknown"
+                skill = "misc"
             motion_name = motion_path.stem
 
-        base_dir = Path(f"./{root_dir}/{dataset}/{category}")
+        base_dir = Path(f"./{root_dir}/{dataset}/{category}/{skill}")
         base_dir.mkdir(parents=True, exist_ok=True)
 
         # Pick smallest unused run number to support append-style repeated runs.
