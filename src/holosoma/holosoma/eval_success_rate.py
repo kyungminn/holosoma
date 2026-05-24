@@ -74,6 +74,11 @@ def main():
                         "and avoid foot penetration during reset. Pass 0.0 to spawn flush with "
                         "the floor (foot collision mesh ~5cm below ankle body, so PhysX bounces "
                         "back up — different transient but no sustained penetration).")
+    parser.add_argument("--save_motion_metrics", action="store_true",
+                        help="Also run MotionMetricsCallback alongside SuccessRateCallback. "
+                        "Accumulates per-env per-step l-mpjpe / dof vel-err / dof acc-err and "
+                        "writes a summary txt report (motion_metrics_iter{N:05d}[_val].txt) into "
+                        "the same log_dir as the success rate report.")
     args = parser.parse_args()
 
     # Load saved config from checkpoint
@@ -227,8 +232,21 @@ def main():
     # config stores eval_callbacks as plain dicts (from YAML) which the
     # instantiate() helper doesn't handle (it expects attribute access, not dict keys).
     from holosoma.agents.callbacks.success_rate_callback import SuccessRateCallback
-    callback = SuccessRateCallback(config=None, training_loop=algo)
-    algo.eval_callbacks = [callback]
+    sr_callback = SuccessRateCallback(config=None, training_loop=algo)
+    callbacks = [sr_callback]
+    if args.save_motion_metrics:
+        from holosoma.agents.callbacks.motion_metrics_callback import MotionMetricsCallback
+        # rl_rate: try to grab from saved config, default 50 Hz.
+        rl_rate = 50.0
+        try:
+            rl_rate = float(getattr(saved_cfg.simulator.config, "rl_rate", 50.0))
+        except Exception:
+            pass
+        metrics_callback = MotionMetricsCallback(
+            config=None, training_loop=algo, sr_callback=sr_callback, rl_rate=rl_rate,
+        )
+        callbacks.append(metrics_callback)
+    algo.eval_callbacks = callbacks
 
     # Run evaluation using PPO's built-in evaluate_policy
     logger.info("Starting success rate evaluation...")

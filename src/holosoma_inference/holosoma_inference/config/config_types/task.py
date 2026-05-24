@@ -48,6 +48,14 @@ class TaskConfig:
     save_debug: bool = False
     """Save debug log for future_motion_targets (sim-to-sim) to compare with Isaac eval."""
 
+    save_metrics: bool = False
+    """If True, collect per-step l-mpjpe / joint-vel / joint-accel errors during motion playback
+    and save them to an npz file when the motion ends (or stop is pressed)."""
+
+    metric_save_path: str | None = None
+    """Destination npz path for the metric log. If None (and save_metrics=True),
+    defaults to ./motion_metrics_<timestamp>.npz in the current working directory."""
+
     auto_press_start_policy_after_s: float = 0.0
     """If > 0, simulate pressing ']' (start policy) this many seconds after the process launches. Sim-to-sim debugging aid for non-interactive runs."""
 

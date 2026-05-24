@@ -354,6 +354,19 @@ class MjwQuaternionView:
         """Return a cloned tensor of the quaternion."""
         return self[:].clone()
 
+    def copy_(self, src):
+        """In-place copy from src into the view. No-op when src is this same view."""
+        if src is self:
+            return self
+        if isinstance(src, MjwQuaternionView):
+            src_tensor = src[:]
+        elif isinstance(src, torch.Tensor):
+            src_tensor = src
+        else:
+            src_tensor = torch.as_tensor(src, device=self.device)
+        self[:] = src_tensor
+        return self
+
     def __repr__(self) -> str:
         return f"<MjwQuaternionView shape={self.shape} device={self.device}>"
 
@@ -538,6 +551,14 @@ class MjwRootStateView:
         Returns 13-element state in holosoma convention:
         [x, y, z, qx, qy, qz, qw, vx, vy, vz, wx, wy, wz]
 
+        IMPORTANT — MuJoCo free-joint qvel convention:
+            qvel[0:3] = linear velocity in WORLD frame
+            qvel[3:6] = angular velocity in BODY frame
+        IsaacSim / IsaacGym convention (= holosoma): both linear AND angular in WORLD frame.
+        We rotate the angular component body→world here so downstream code that
+        assumes IsaacSim-style world-frame ang vel (e.g. ``base_ang_vel`` obs term
+        which then rotates world→body via ``quat_rotate_inverse``) works correctly.
+
         Parameters
         ----------
         key : int, slice, tuple, or tensor
@@ -548,17 +569,23 @@ class MjwRootStateView:
         torch.Tensor
             Root state with quaternion in holosoma format
         """
+        from holosoma.utils.rotations import quat_rotate  # local import to avoid cycle
+
         # Extract components
-        pos = self.qpos[:, self.pos_slice]  # [N, 3]
-        quat_mj = self.qpos[:, self.quat_slice]  # [N, 4] - [w, x, y, z]
-        lin_vel = self.qvel[:, self.vel_slice]  # [N, 3]
-        ang_vel = self.qvel[:, self.ang_vel_slice]  # [N, 3]
+        pos = self.qpos[:, self.pos_slice]                # [N, 3]
+        quat_mj = self.qpos[:, self.quat_slice]           # [N, 4] - [w, x, y, z]
+        lin_vel_world = self.qvel[:, self.vel_slice]      # [N, 3] - world frame
+        ang_vel_body = self.qvel[:, self.ang_vel_slice]   # [N, 3] - BODY frame!
 
         # Convert quaternion: [w, x, y, z] -> [x, y, z, w]
         quat_holo = quat_mj[:, [1, 2, 3, 0]]
 
+        # Rotate body-frame angular velocity to world frame so the holosoma
+        # contract (root_state[10:13] = world-frame ang vel) is honoured.
+        ang_vel_world = quat_rotate(quat_holo, ang_vel_body, w_last=True)
+
         # Assemble full state
-        root_state = torch.cat([pos, quat_holo, lin_vel, ang_vel], dim=1)
+        root_state = torch.cat([pos, quat_holo, lin_vel_world, ang_vel_world], dim=1)
 
         return root_state[key]
 
@@ -582,20 +609,26 @@ class MjwRootStateView:
 
         # Optimized path for full slice [:] (most common case)
         if key == slice(None):
+            from holosoma.utils.rotations import quat_rotate_inverse  # local import
+
             # Input: [N, 13]
             pos = val[:, 0:3]
-            quat_holo = val[:, 3:7]  # [x, y, z, w]
-            lin_vel = val[:, 7:10]
-            ang_vel = val[:, 10:13]
+            quat_holo = val[:, 3:7]              # [x, y, z, w]
+            lin_vel_world = val[:, 7:10]
+            ang_vel_world = val[:, 10:13]        # holosoma contract: WORLD frame
 
             # Convert quaternion: [x, y, z, w] -> [w, x, y, z]
             quat_mj = quat_holo[:, [3, 0, 1, 2]]
 
+            # Rotate world-frame angular velocity into body frame, because
+            # MuJoCo free-joint qvel[3:6] is stored in BODY frame (not world).
+            ang_vel_body = quat_rotate_inverse(quat_holo, ang_vel_world, w_last=True)
+
             # Write to underlying tensors (modifies Warp arrays via zero-copy)
             self.qpos[:, self.pos_slice] = pos
             self.qpos[:, self.quat_slice] = quat_mj
-            self.qvel[:, self.vel_slice] = lin_vel
-            self.qvel[:, self.ang_vel_slice] = ang_vel
+            self.qvel[:, self.vel_slice] = lin_vel_world
+            self.qvel[:, self.ang_vel_slice] = ang_vel_body
         else:
             # Partial indexing requires read-modify-write
             current = self[:]
