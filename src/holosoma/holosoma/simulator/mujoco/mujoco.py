@@ -732,18 +732,27 @@ class MuJoCo(BaseSimulator):
                 device=self.sim_device,
             )
 
-        # Initialize rigid body state tensors (required by BaseTask)
+        # Initialize rigid body state tensors (required by BaseTask).
+        # NOTE: MuJoCo's nbody includes the world body at index 0, but holosoma's
+        # `body_names` / `_body_list` excludes it, so other simulators
+        # (IsaacGym/IsaacSim) populate _rigid_body_pos with ROBOT bodies only.
+        # We match that convention here so indices into `_rigid_body_pos`
+        # line up with `body_names`. The number of world bodies stripped
+        # (typically 1) is stored so refresh_sim_tensors can slice the raw
+        # MuJoCo xpos table consistently.
+        self._n_rigid_bodies = len(self.body_names)
+        self._world_body_offset = self.num_bodies - self._n_rigid_bodies
         self._rigid_body_pos = torch.zeros(
-            self.num_envs, self.num_bodies, 3, device=self.sim_device, dtype=torch.float32
+            self.num_envs, self._n_rigid_bodies, 3, device=self.sim_device, dtype=torch.float32
         )
         self._rigid_body_rot = torch.zeros(
-            self.num_envs, self.num_bodies, 4, device=self.sim_device, dtype=torch.float32
+            self.num_envs, self._n_rigid_bodies, 4, device=self.sim_device, dtype=torch.float32
         )
         self._rigid_body_vel = torch.zeros(
-            self.num_envs, self.num_bodies, 3, device=self.sim_device, dtype=torch.float32
+            self.num_envs, self._n_rigid_bodies, 3, device=self.sim_device, dtype=torch.float32
         )
         self._rigid_body_ang_vel = torch.zeros(
-            self.num_envs, self.num_bodies, 3, device=self.sim_device, dtype=torch.float32
+            self.num_envs, self._n_rigid_bodies, 3, device=self.sim_device, dtype=torch.float32
         )
 
     def prepare_randomization_fields(self, field_names: list[str]) -> None:
@@ -790,29 +799,35 @@ class MuJoCo(BaseSimulator):
         if rigid_body_views is not None:
             # Fast path: zero-copy GPU tensors (WarpBackend)
             # Eliminates 132 tensor allocations per frame for G1 robot (33 bodies x 4 tensors)
+            # Slice off the world body (MuJoCo body 0) so indices match `body_names`.
+            offset = self._world_body_offset
             positions, orientations, linear_vel, angular_vel = rigid_body_views
-            self._rigid_body_pos[:] = positions
-            self._rigid_body_rot[:] = orientations
-            self._rigid_body_vel[:] = linear_vel
-            self._rigid_body_ang_vel[:] = angular_vel
+            self._rigid_body_pos[:] = positions[:, offset:]
+            self._rigid_body_rot[:] = orientations[:, offset:]
+            self._rigid_body_vel[:] = linear_vel[:, offset:]
+            self._rigid_body_ang_vel[:] = angular_vel[:, offset:]
         else:
             # Slow path: CPU loop with tensor allocation (ClassicBackend)
             assert self.root_model
             assert self.root_data
-            for body_id in range(self.num_bodies):
+            # Iterate MuJoCo body ids; skip the world body so the destination
+            # index (target_id) matches `body_names` / `_body_list` indexing.
+            offset = self._world_body_offset
+            for body_id in range(offset, self.num_bodies):
+                target_id = body_id - offset
                 assert body_id < self.root_model.nbody, (
                     f"Body ID {body_id} exceeds model bodies {self.root_model.nbody}"
                 )
 
                 # Positions (direct access to global coordinates)
-                self._rigid_body_pos[0, body_id] = (
+                self._rigid_body_pos[0, target_id] = (
                     torch.from_numpy(self.root_data.xpos[body_id]).float().to(self.sim_device)
                 )
 
                 # Quaternions (convert MuJoCo w,x,y,z to holosoma x,y,z,w)
                 mj_quat = self.root_data.xquat[body_id]  # [w, x, y, z]
                 holosoma_quat = [mj_quat[1], mj_quat[2], mj_quat[3], mj_quat[0]]  # [x, y, z, w]
-                self._rigid_body_rot[0, body_id] = torch.tensor(
+                self._rigid_body_rot[0, target_id] = torch.tensor(
                     holosoma_quat, device=self.sim_device, dtype=torch.float32
                 )
 
@@ -823,8 +838,8 @@ class MuJoCo(BaseSimulator):
                 )
 
                 # Extract angular and linear velocities
-                self._rigid_body_ang_vel[0, body_id] = torch.from_numpy(body_vel[:3]).float().to(self.sim_device)
-                self._rigid_body_vel[0, body_id] = torch.from_numpy(body_vel[3:]).float().to(self.sim_device)
+                self._rigid_body_ang_vel[0, target_id] = torch.from_numpy(body_vel[:3]).float().to(self.sim_device)
+                self._rigid_body_vel[0, target_id] = torch.from_numpy(body_vel[3:]).float().to(self.sim_device)
 
         # Update contact forces and history via backend delegation
         if hasattr(self, "contact_forces_history") and hasattr(self, "contact_forces"):

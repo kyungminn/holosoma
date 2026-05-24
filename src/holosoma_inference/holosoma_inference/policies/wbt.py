@@ -47,6 +47,11 @@ class PinocchioRobot:
         # get ref body frame id in pinocchio robot
         self.ref_body_frame_id = self.robot_model.getFrameId(robot_cfg.motion["body_name_ref"][0])
 
+        # Optional: cache tracked-body frame IDs for metric collection (l-mpjpe).
+        tracked_body_names = robot_cfg.motion.get("body_names_to_track", [])
+        self.tracked_body_names = list(tracked_body_names)
+        self.tracked_frame_ids = [self.robot_model.getFrameId(name) for name in self.tracked_body_names]
+
     def fk_and_get_ref_body_orientation_in_world(self, configuration: np.ndarray) -> np.ndarray:
         # forward kinematics
         pin.framesForwardKinematics(self.robot_model, self.robot_data, configuration)
@@ -56,6 +61,22 @@ class PinocchioRobot:
         quaternion = pin.Quaternion(ref_body_pose_in_world.rotation)  # (4, )
 
         return np.expand_dims(quaternion.coeffs(), axis=0)  # xyzw, (1, 4)
+
+    def fk_and_get_tracked_body_positions(self, configuration: np.ndarray) -> np.ndarray:
+        """Run FK and return (translation, rotation_matrix) for every tracked body.
+
+        Returns:
+            positions: (N, 3) array of body translations in the world frame.
+            rotations: (N, 3, 3) array of body rotation matrices.
+        """
+        pin.framesForwardKinematics(self.robot_model, self.robot_data, configuration)
+        positions = np.zeros((len(self.tracked_frame_ids), 3), dtype=np.float32)
+        rotations = np.zeros((len(self.tracked_frame_ids), 3, 3), dtype=np.float32)
+        for i, frame_id in enumerate(self.tracked_frame_ids):
+            oMf = self.robot_data.oMf[frame_id]
+            positions[i] = oMf.translation
+            rotations[i] = oMf.rotation
+        return positions, rotations
 
     @staticmethod
     def _create_xml_from_urdf(urdf_text: str) -> str:
@@ -98,6 +119,25 @@ class WholeBodyTrackingPolicy(BasePolicy):
 
         # Read use_sim_time from config
         self.use_sim_time = config.task.use_sim_time
+
+        # Metric collection (l-mpjpe, joint vel/accel error) buffers — only used
+        # when task.save_metrics=True and motion_data is loaded.
+        self.save_metrics = bool(getattr(config.task, "save_metrics", False))
+        self.metric_save_path = getattr(config.task, "metric_save_path", None)
+        self._metric_buffer: dict[str, list] = {
+            "motion_timestep": [],
+            "pred_body_pos_w": [],   # (N, 3) per step, world frame
+            "pred_root_pos_w": [],   # (3,)
+            "pred_root_quat_xyzw": [],  # (4,)
+            "gt_body_pos_w": [],     # (N, 3)
+            "gt_root_pos_w": [],     # (3,)
+            "gt_root_quat_xyzw": [],  # (4,)
+            "pred_dof_pos": [],      # (num_dofs,)
+            "pred_dof_vel": [],      # (num_dofs,)
+            "gt_dof_pos": [],        # (num_dofs,)
+            "gt_dof_vel": [],        # (num_dofs,)
+        }
+        self._metrics_saved = False
 
         self._stiff_hold_active = True
         self.robot_yaw_offset = 0.0
@@ -766,6 +806,11 @@ class WholeBodyTrackingPolicy(BasePolicy):
                     "green",
                 )
             )
+            # Save metrics here (before held-at-end takes over) so we capture exactly
+            # the full motion playback window. _handle_stop_policy also calls this
+            # but only fires when the user actually stops; the natural-end case
+            # needs its own trigger.
+            self._save_metrics()
             # Keep `motion_clip_progressing=True` so rl_inference does not reset
             # motion_timestep back to 0. Set a flag to stop clock-driven advance.
             self._motion_held_at_end = True
@@ -946,6 +991,17 @@ class WholeBodyTrackingPolicy(BasePolicy):
                 + ramp_alpha * self._held_action_filt
             )
 
+        # Collect per-step tracking metrics (l-mpjpe + joint vel/accel error sources).
+        # Only runs while motion is actively progressing (not during the held-at-end
+        # phase) and only when save_metrics is enabled and motion data is loaded.
+        if (
+            self.save_metrics
+            and self.motion_data is not None
+            and self.motion_clip_progressing
+            and not getattr(self, "_motion_held_at_end", False)
+        ):
+            self._collect_metric_step(robot_state_data)
+
         # update motion timestep
         if self.motion_clip_progressing and not getattr(self, "_motion_held_at_end", False):
             if self.use_sim_time:
@@ -961,6 +1017,196 @@ class WholeBodyTrackingPolicy(BasePolicy):
                 self._motion_finished = True
 
         return self.scaled_policy_action
+
+    def _collect_metric_step(self, robot_state_data):
+        """Append one frame of GT/pred data to the metric buffer."""
+        t = min(self.motion_timestep, self.motion_data["time_step_total"] - 1)
+
+        # Predicted side: FK from robot state.
+        num_dofs = self.num_dofs
+        root_pos = robot_state_data[0, :3].astype(np.float32)
+        root_quat_xyzw = wxyz_to_xyzw(robot_state_data[:, 3:7])[0].astype(np.float32)
+        dof_pos_real = robot_state_data[0, 7 : 7 + num_dofs]
+        dof_pos_pin = dof_pos_real[self.pinocchio_robot.real2pinocchio_index]
+        configuration = np.concatenate([root_pos, root_quat_xyzw, dof_pos_pin], axis=0)
+        pred_body_pos_w, _ = self.pinocchio_robot.fk_and_get_tracked_body_positions(configuration)
+        pred_dof_vel = robot_state_data[
+            0, 7 + num_dofs + 6 : 7 + num_dofs + 6 + num_dofs
+        ].astype(np.float32)
+
+        # GT side: pull from motion data using the same tracked-body ordering.
+        body_indices = self.motion_data["body_indices"]
+        root_idx = self.motion_data["root_body_index"]
+        gt_body_pos_w = self.motion_data["body_pos_w"][t][body_indices].astype(np.float32)
+        gt_root_pos_w = self.motion_data["body_pos_w"][t, root_idx].astype(np.float32)
+        gt_root_quat_xyzw = self.motion_data["body_quat_w"][t, root_idx].astype(np.float32)
+        gt_dof_pos = self.motion_data["joint_pos"][t].astype(np.float32)
+        gt_dof_vel = self.motion_data["joint_vel"][t].astype(np.float32)
+
+        buf = self._metric_buffer
+        buf["motion_timestep"].append(int(t))
+        buf["pred_body_pos_w"].append(pred_body_pos_w)
+        buf["pred_root_pos_w"].append(root_pos)
+        buf["pred_root_quat_xyzw"].append(root_quat_xyzw)
+        buf["gt_body_pos_w"].append(gt_body_pos_w)
+        buf["gt_root_pos_w"].append(gt_root_pos_w)
+        buf["gt_root_quat_xyzw"].append(gt_root_quat_xyzw)
+        buf["pred_dof_pos"].append(dof_pos_real.astype(np.float32))
+        buf["pred_dof_vel"].append(pred_dof_vel)
+        buf["gt_dof_pos"].append(gt_dof_pos)
+        buf["gt_dof_vel"].append(gt_dof_vel)
+
+    def _resolve_default_save_path(self) -> str:
+        """Auto-derive save path:
+            ./sim_to_{sim,real}_log_metrics/{dataset}/{category}/{motion}_runNN.npz
+
+        - sim_mode: 'sim_to_sim' if use_sim_time else 'sim_to_real'
+        - dataset:  'phuma' / 'amass' / 'unknown' (detected from model_path substring)
+        - category: motion_file_path's parent dir name, lowercased
+        - motion:   motion_file_path filename stem
+        - runNN:    smallest unused 2-digit run number (01, 02, ...)
+        """
+        root_dir = "sim_to_sim_log_metrics" if self.use_sim_time else "sim_to_real_log_metrics"
+
+        model_paths = self.config.task.model_path
+        if isinstance(model_paths, list):
+            model_str = " ".join(str(p) for p in model_paths).lower()
+        else:
+            model_str = str(model_paths).lower()
+        if "phuma" in model_str:
+            dataset = "phuma"
+        elif "amass" in model_str:
+            dataset = "amass"
+        else:
+            dataset = "unknown"
+
+        motion_file_path = self.config.task.motion_file_path
+        if motion_file_path is None:
+            category = "unknown"
+            motion_name = "unknown_motion"
+        else:
+            motion_path = Path(motion_file_path)
+            category = (motion_path.parent.name or "misc").lower()
+            motion_name = motion_path.stem
+
+        base_dir = Path(f"./{root_dir}/{dataset}/{category}")
+        base_dir.mkdir(parents=True, exist_ok=True)
+
+        # Pick smallest unused run number to support append-style repeated runs.
+        existing_nums = []
+        for p in base_dir.glob(f"{motion_name}_run*.npz"):
+            suffix = p.stem[len(motion_name):]  # "_runNN"
+            if suffix.startswith("_run"):
+                try:
+                    existing_nums.append(int(suffix[len("_run"):]))
+                except ValueError:
+                    pass
+        next_num = (max(existing_nums) + 1) if existing_nums else 1
+        return str(base_dir / f"{motion_name}_run{next_num:02d}.npz")
+
+    def _save_metrics(self):
+        """Compute l-mpjpe / joint-vel / joint-accel errors and dump to npz."""
+        if not self.save_metrics or self._metrics_saved:
+            return
+        buf = self._metric_buffer
+        if len(buf["motion_timestep"]) == 0:
+            self.logger.warning("save_metrics enabled but no frames were collected; nothing to save.")
+            return
+
+        ts = np.array(buf["motion_timestep"], dtype=np.int64)
+        pred_body = np.stack(buf["pred_body_pos_w"], axis=0)        # [T, B, 3]
+        pred_root = np.stack(buf["pred_root_pos_w"], axis=0)        # [T, 3]
+        pred_root_q = np.stack(buf["pred_root_quat_xyzw"], axis=0)  # [T, 4]
+        gt_body = np.stack(buf["gt_body_pos_w"], axis=0)            # [T, B, 3]
+        gt_root = np.stack(buf["gt_root_pos_w"], axis=0)            # [T, 3]
+        gt_root_q = np.stack(buf["gt_root_quat_xyzw"], axis=0)      # [T, 4]
+        pred_dof_pos = np.stack(buf["pred_dof_pos"], axis=0)        # [T, D]
+        pred_dof_vel = np.stack(buf["pred_dof_vel"], axis=0)        # [T, D]
+        gt_dof_pos = np.stack(buf["gt_dof_pos"], axis=0)            # [T, D]
+        gt_dof_vel = np.stack(buf["gt_dof_vel"], axis=0)            # [T, D]
+
+        # l-mpjpe: body positions in their respective root frames.
+        # local = R_root^T @ (body_pos_w - root_pos_w). Removes both root
+        # translation and rotation so the metric only reflects body-pose error.
+        def to_root_frame(body_w, root_w, root_q_xyzw):
+            x, y, z, w = root_q_xyzw[..., 0], root_q_xyzw[..., 1], root_q_xyzw[..., 2], root_q_xyzw[..., 3]
+            # rotation matrix from xyzw quaternion, shape [T, 3, 3]
+            xx, yy, zz = x * x, y * y, z * z
+            xy, xz, yz = x * y, x * z, y * z
+            wx, wy, wz = w * x, w * y, w * z
+            R = np.stack([
+                np.stack([1 - 2 * (yy + zz), 2 * (xy - wz),     2 * (xz + wy)],     axis=-1),
+                np.stack([2 * (xy + wz),     1 - 2 * (xx + zz), 2 * (yz - wx)],     axis=-1),
+                np.stack([2 * (xz - wy),     2 * (yz + wx),     1 - 2 * (xx + yy)], axis=-1),
+            ], axis=-2)  # [T, 3, 3]
+            local = body_w - root_w[:, None, :]
+            # R^T @ local: einsum over batch and per-body
+            return np.einsum("tij,tbj->tbi", R.transpose(0, 2, 1), local)
+
+        pred_local = to_root_frame(pred_body, pred_root, pred_root_q)
+        gt_local = to_root_frame(gt_body, gt_root, gt_root_q)
+
+        per_body_err_mm = np.linalg.norm(pred_local - gt_local, axis=-1) * 1000.0  # [T, B]
+        l_mpjpe_per_body_mm = per_body_err_mm.mean(axis=0)                          # [B]
+        l_mpjpe_mean_mm = float(per_body_err_mm.mean())
+
+        # Joint velocity / acceleration error.
+        dof_vel_err = pred_dof_vel - gt_dof_vel                                       # [T, D]
+        # Acceleration via finite-difference on velocity (avoids assumptions about
+        # discrete dt; we report errors of *finite-differenced* accel, equivalent
+        # to ASAP's compute_error_accel up to a scale factor).
+        dt = 1.0 / float(self.config.task.rl_rate)
+        if pred_dof_vel.shape[0] >= 2:
+            pred_dof_acc = np.diff(pred_dof_vel, axis=0) / dt
+            gt_dof_acc = np.diff(gt_dof_vel, axis=0) / dt
+            dof_acc_err = pred_dof_acc - gt_dof_acc
+        else:
+            dof_acc_err = np.zeros_like(dof_vel_err)
+
+        vel_err_mean = float(np.linalg.norm(dof_vel_err, axis=-1).mean())
+        acc_err_mean = float(np.linalg.norm(dof_acc_err, axis=-1).mean())
+
+        body_names = list(self.pinocchio_robot.tracked_body_names)
+
+        save_path = self.metric_save_path
+        if save_path is None:
+            save_path = self._resolve_default_save_path()
+        save_path = str(Path(save_path).expanduser())
+        Path(save_path).parent.mkdir(parents=True, exist_ok=True)
+
+        np.savez(
+            save_path,
+            motion_timestep=ts,
+            pred_body_pos_w=pred_body,
+            pred_root_pos_w=pred_root,
+            pred_root_quat_xyzw=pred_root_q,
+            gt_body_pos_w=gt_body,
+            gt_root_pos_w=gt_root,
+            gt_root_quat_xyzw=gt_root_q,
+            pred_dof_pos=pred_dof_pos,
+            pred_dof_vel=pred_dof_vel,
+            gt_dof_pos=gt_dof_pos,
+            gt_dof_vel=gt_dof_vel,
+            l_mpjpe_per_step_per_body_mm=per_body_err_mm,
+            l_mpjpe_per_body_mm=l_mpjpe_per_body_mm,
+            l_mpjpe_mean_mm=np.float32(l_mpjpe_mean_mm),
+            dof_vel_err=dof_vel_err,
+            dof_acc_err=dof_acc_err,
+            dof_vel_err_mean=np.float32(vel_err_mean),
+            dof_acc_err_mean=np.float32(acc_err_mean),
+            tracked_body_names=np.array(body_names),
+            rl_rate=np.float32(self.config.task.rl_rate),
+        )
+        self._metrics_saved = True
+        self.logger.info(
+            colored(
+                f"[metrics] Saved {len(ts)} steps to {save_path} | "
+                f"l-mpjpe(mean)={l_mpjpe_mean_mm:.2f} mm | "
+                f"vel_err(mean)={vel_err_mean:.3f} rad/s | "
+                f"acc_err(mean)={acc_err_mean:.2f} rad/s² ",
+                "cyan",
+            )
+        )
 
     def _get_manual_command(self, robot_state_data):
         # TODO: instead of adding kp/kd_override in def _set_motor_command,
@@ -1037,6 +1283,9 @@ class WholeBodyTrackingPolicy(BasePolicy):
             )
             return
 
+        # Persist metrics before tearing down motion state.
+        self._save_metrics()
+
         self.use_policy_action = False
         self.get_ready_state = False
         self._stiff_hold_active = True
@@ -1085,6 +1334,11 @@ class WholeBodyTrackingPolicy(BasePolicy):
             self._debug_logged_timesteps.clear()
         if hasattr(self, '_debug_policy_io_log'):
             self._debug_policy_io_log = []
+        # Reset metric buffer so each motion run produces its own npz.
+        if self.save_metrics:
+            for k in self._metric_buffer:
+                self._metric_buffer[k] = []
+            self._metrics_saved = False
         self.logger.info(colored("Starting motion clip", "blue"))
 
     def handle_keyboard_button(self, keycode):

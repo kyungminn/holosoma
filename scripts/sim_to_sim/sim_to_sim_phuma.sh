@@ -19,8 +19,10 @@
 source scripts/source_inference_setup.sh
 python3 src/holosoma_inference/holosoma_inference/run_policy.py inference:g1-29dof-wbt-future-motion \
     --task.model-path ./pretrained/phuma_g1_29dof_new/model_104000.onnx \
-    --task.motion-file-path ./selected_motions/PHUMA_unseen_video/walk_chunk_0003.npz \
+    --task.motion-file-path ./selected_motions/PHUMA/Vertical/LocoMuJoCo_squat_chunk_0009.npz \
     --task.no-use-joystick \
     --task.use-sim-time \
     --task.rl-rate 50 \
-    --task.interface lo
+    --task.interface lo \
+    --task.save-metrics \
+    "$@"

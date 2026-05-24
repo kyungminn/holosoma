@@ -522,11 +522,16 @@ class WarpBackend(IMujocoBackend):
         # Extract state components
         pos = root_states[:, :3]  # [N, 3]
         quat_holo = root_states[:, 3:7]  # [N, 4] [qx, qy, qz, qw]
-        lin_vel = root_states[:, 7:10]  # [N, 3]
-        ang_vel = root_states[:, 10:13]  # [N, 3]
+        lin_vel = root_states[:, 7:10]  # [N, 3] world (holosoma contract)
+        ang_vel_world = root_states[:, 10:13]  # [N, 3] world (holosoma contract)
 
         # Convert quaternion: holosoma [qx,qy,qz,qw] -> MuJoCo [qw,qx,qy,qz]
         quat_mj = quat_holo[:, [3, 0, 1, 2]]
+
+        # MuJoCo free-joint qvel[3:6] is in BODY frame (not world). Rotate
+        # world-frame angular velocity into body frame before writing.
+        from holosoma.utils.rotations import quat_rotate_inverse
+        ang_vel = quat_rotate_inverse(quat_holo, ang_vel_world, w_last=True)
 
         # Get addresses
         qpos_addr = root_addrs["robot_qpos_addr"]
