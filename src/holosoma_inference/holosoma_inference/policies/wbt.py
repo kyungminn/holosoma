@@ -1147,30 +1147,35 @@ class WholeBodyTrackingPolicy(BasePolicy):
         gt_dof_pos = np.stack(buf["gt_dof_pos"], axis=0)            # [T, D]
         gt_dof_vel = np.stack(buf["gt_dof_vel"], axis=0)            # [T, D]
 
-        # l-mpjpe: body positions in their respective root frames.
-        # local = R_root^T @ (body_pos_w - root_pos_w). Removes both root
-        # translation and rotation so the metric only reflects body-pose error.
-        def to_root_frame(body_w, root_w, root_q_xyzw):
-            x, y, z, w = root_q_xyzw[..., 0], root_q_xyzw[..., 1], root_q_xyzw[..., 2], root_q_xyzw[..., 3]
-            # rotation matrix from xyzw quaternion, shape [T, 3, 3]
-            xx, yy, zz = x * x, y * y, z * z
-            xy, xz, yz = x * y, x * z, y * z
-            wx, wy, wz = w * x, w * y, w * z
-            R = np.stack([
-                np.stack([1 - 2 * (yy + zz), 2 * (xy - wz),     2 * (xz + wy)],     axis=-1),
-                np.stack([2 * (xy + wz),     1 - 2 * (xx + zz), 2 * (yz - wx)],     axis=-1),
-                np.stack([2 * (xz - wy),     2 * (yz + wx),     1 - 2 * (xx + yy)], axis=-1),
-            ], axis=-2)  # [T, 3, 3]
-            local = body_w - root_w[:, None, :]
-            # R^T @ local: einsum over batch and per-body
-            return np.einsum("tij,tbj->tbi", R.transpose(0, 2, 1), local)
-
-        pred_local = to_root_frame(pred_body, pred_root, pred_root_q)
-        gt_local = to_root_frame(gt_body, gt_root, gt_root_q)
+        # l-mpjpe (ASAP / PHC convention, smpl_sim.compute_metrics_lite):
+        # subtract each set's OWN root POSITION only (no rotation alignment),
+        # keeping world orientation. Unlike g-mpjpe, the absolute root world
+        # position cancels here, so this stays valid on the real robot even
+        # though that position drifts / isn't reliably observable; the body
+        # offsets are already expressed in a world-aligned frame (root
+        # orientation comes from the state estimator). The previous
+        # `to_root_frame` removed root rotation too, which over-discounts the
+        # error — ASAP keeps world orientation.
+        pred_local = pred_body - pred_root[:, None, :]  # [T, B, 3], world orientation, root translation removed
+        gt_local = gt_body - gt_root[:, None, :]        # [T, B, 3]
 
         per_body_err_mm = np.linalg.norm(pred_local - gt_local, axis=-1) * 1000.0  # [T, B]
         l_mpjpe_per_body_mm = per_body_err_mm.mean(axis=0)                          # [B]
         l_mpjpe_mean_mm = float(per_body_err_mm.mean())
+
+        # g-mpjpe (world frame, whole-body) — same quantity the training-time SR
+        # callback thresholds. Only trustworthy when the absolute root world
+        # position is accurate, i.e. in sim deploy (use_sim_time), where the
+        # simulator reports ground-truth root pose. On the real robot the root
+        # world position drifts, so g-mpjpe is computed-and-saved but NOT used
+        # for success there. First-frame root alignment: shift the reference so
+        # its t=0 root coincides with the robot's t=0 root (mirrors the SR
+        # callback's _align_offset), leaving pure global drift.
+        g_align = pred_root[0] - gt_root[0]                                  # [3]
+        gt_body_aligned = gt_body + g_align[None, None, :]                   # [T, B, 3]
+        per_body_err_global_mm = np.linalg.norm(pred_body - gt_body_aligned, axis=-1) * 1000.0  # [T, B]
+        g_mpjpe_per_body_mm = per_body_err_global_mm.mean(axis=0)            # [B]
+        g_mpjpe_mean_mm = float(per_body_err_global_mm.mean())
 
         # Joint velocity / acceleration error.
         dof_vel_err = pred_dof_vel - gt_dof_vel                                       # [T, D]
@@ -1190,17 +1195,27 @@ class WholeBodyTrackingPolicy(BasePolicy):
 
         body_names = list(self.pinocchio_robot.tracked_body_names)
 
-        # Success indicators based on per-step body tracking.
-        # We use the per-step MEAN over bodies of l-mpjpe (root-aligned, mm) as
-        # the indicator: if it ever exceeds the threshold, mark as failed.
-        # Mirrors the SR-callback convention (per-step body-error threshold), but
-        # adapted for inference-time root-aligned metrics (since the real-robot
-        # interface doesn't expose absolute root world position).
+        # Per-step l-mpjpe summary (always saved as a metric).
         per_step_mean_l_mpjpe_mm = per_body_err_mm.mean(axis=1)              # [T]
         max_per_step_mean_l_mpjpe_mm = float(per_step_mean_l_mpjpe_mm.max())
-        success_0_5m  = bool(max_per_step_mean_l_mpjpe_mm < 500.0)
-        success_0_25m = bool(max_per_step_mean_l_mpjpe_mm < 250.0)
-        success_0_15m = bool(max_per_step_mean_l_mpjpe_mm < 150.0)
+
+        # Success is measured ONLY in sim deploy, via g-mpjpe with the ANY-body,
+        # per-step rule — identical to the training-time SuccessRateCallback
+        # (fail if ANY tracked body's global error exceeds the threshold at any
+        # step). The simulator reports ground-truth root world pose, so g-mpjpe
+        # is valid. On the real robot the root world position drifts, so there is
+        # no reliable whole-body success signal — success is NOT measured there.
+        if self.use_sim_time:
+            success_basis = "g-mpjpe any-body (sim)"
+            per_step_max_body_g_mm = per_body_err_global_mm.max(axis=1)      # [T] worst body each step
+            success_metric_mm = float(per_step_max_body_g_mm.max())          # worst over all steps & bodies
+            success_0_5m  = bool(success_metric_mm < 500.0)
+            success_0_25m = bool(success_metric_mm < 250.0)
+            success_0_15m = bool(success_metric_mm < 150.0)
+        else:
+            success_basis = "not measured (real)"
+            success_metric_mm = None
+            success_0_5m = success_0_25m = success_0_15m = None
 
         save_path = self.metric_save_path
         if save_path is None:
@@ -1208,8 +1223,7 @@ class WholeBodyTrackingPolicy(BasePolicy):
         save_path = str(Path(save_path).expanduser())
         Path(save_path).parent.mkdir(parents=True, exist_ok=True)
 
-        np.savez(
-            save_path,
+        save_kwargs = dict(
             motion_timestep=ts,
             pred_body_pos_w=pred_body,
             pred_root_pos_w=pred_root,
@@ -1224,31 +1238,45 @@ class WholeBodyTrackingPolicy(BasePolicy):
             l_mpjpe_per_step_per_body_mm=per_body_err_mm,
             l_mpjpe_per_body_mm=l_mpjpe_per_body_mm,
             l_mpjpe_mean_mm=np.float32(l_mpjpe_mean_mm),
+            g_mpjpe_per_step_per_body_mm=per_body_err_global_mm,
+            g_mpjpe_per_body_mm=g_mpjpe_per_body_mm,
+            g_mpjpe_mean_mm=np.float32(g_mpjpe_mean_mm),
             dof_vel_err=dof_vel_err,
             dof_acc_err=dof_acc_err,
             dof_vel_err_mean=np.float32(vel_err_mean),
             dof_acc_err_mean=np.float32(acc_err_mean),
             tracked_body_names=np.array(body_names),
             rl_rate=np.float32(self.config.task.rl_rate),
-            # Success indicators
             motion_completed=np.bool_(motion_completed),
-            success_0_5m=np.bool_(success_0_5m),
-            success_0_25m=np.bool_(success_0_25m),
-            success_0_15m=np.bool_(success_0_15m),
             max_per_step_mean_l_mpjpe_mm=np.float32(max_per_step_mean_l_mpjpe_mm),
+            success_basis=np.str_(success_basis),
         )
+        # Success indicators are only written in sim deploy (see above).
+        if self.use_sim_time:
+            save_kwargs.update(
+                success_0_5m=np.bool_(success_0_5m),
+                success_0_25m=np.bool_(success_0_25m),
+                success_0_15m=np.bool_(success_0_15m),
+                success_metric_mm=np.float32(success_metric_mm),
+            )
+        np.savez(save_path, **save_kwargs)
         self._metrics_saved = True
         completed_tag = "completed" if motion_completed else "stopped early"
-        success_tag = (
-            f"0.5m={'OK' if success_0_5m else 'FAIL'}  "
-            f"0.25m={'OK' if success_0_25m else 'FAIL'}  "
-            f"0.15m={'OK' if success_0_15m else 'FAIL'}"
-        )
+        if self.use_sim_time:
+            success_tag = (
+                f"success [{success_basis}]: "
+                f"0.5m={'OK' if success_0_5m else 'FAIL'}  "
+                f"0.25m={'OK' if success_0_25m else 'FAIL'}  "
+                f"0.15m={'OK' if success_0_15m else 'FAIL'} "
+                f"(metric={success_metric_mm:.1f} mm)"
+            )
+        else:
+            success_tag = "success: not measured (real)"
         self.logger.info(
             colored(
                 f"[metrics] Saved {len(ts)} steps to {save_path} | "
-                f"motion={completed_tag} | success {success_tag} | "
-                f"max-per-step mean l-mpjpe={max_per_step_mean_l_mpjpe_mm:.1f} mm | "
+                f"motion={completed_tag} | {success_tag} | "
+                f"g-mpjpe(mean)={g_mpjpe_mean_mm:.2f} mm | "
                 f"l-mpjpe(mean)={l_mpjpe_mean_mm:.2f} mm | "
                 f"vel_err(mean)={vel_err_mean:.3f} rad/s | "
                 f"acc_err(mean)={acc_err_mean:.2f} rad/s² ",
