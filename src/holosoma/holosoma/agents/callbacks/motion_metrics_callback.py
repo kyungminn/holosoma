@@ -253,15 +253,28 @@ class MotionMetricsCallback(RLEvalCallback):
         curr_body_pos_pred = mc.robot_body_pos_w[:batch_size]  # [batch_size, B, 3]
         curr_body_pos_gt = mc.body_pos_w[:batch_size]          # [batch_size, B, 3]
 
-        # g-mpjpe: world-frame per-body position error (no root alignment).
-        # Captures root drift AND body-pose error together.
+        # Align the reference's first-frame root to the robot's spawn root using
+        # the same offset SR captured in its _setup_batch. This removes the
+        # artificial init_root_offset Z lift (+~10cm) baked into the spawn pose
+        # so g-mpjpe measures real global drift, consistent with the SR check.
+        align_offset = getattr(self._sr_callback, "_align_offset", None) if self._sr_callback is not None else None
+        if align_offset is not None:
+            curr_body_pos_gt = curr_body_pos_gt + align_offset[:batch_size, None, :]
+
+        # g-mpjpe: world-frame per-body position error (after first-frame root
+        # alignment). Captures real global root drift AND body-pose error.
         body_err_global_mm = torch.norm(curr_body_pos_pred - curr_body_pos_gt, dim=-1) * 1000.0  # [B, B]
 
-        # l-mpjpe: root-relative per-body position error (motion aligned to robot
-        # torso XY+yaw, Z and tilt preserved). Captures body-pose error only.
-        body_err_mm = (
-            torch.norm(mc.body_pos_relative_w - mc.robot_body_pos_w, dim=-1) * 1000.0
-        )[:batch_size]  # [batch_size, B]
+        # l-mpjpe (ASAP / PHC convention, smpl_sim.compute_metrics_lite): express
+        # each body relative to its OWN root (body 0 = pelvis) by pure xyz
+        # translation subtraction — NO rotation alignment — then compare. This
+        # differs from the previous XY+yaw-aligned `body_pos_relative_w`; root
+        # translation cancels env_origins + init lift automatically.
+        ref_body_w = mc.body_pos_w[:batch_size]          # [batch_size, B, 3]
+        robot_body_w = mc.robot_body_pos_w[:batch_size]  # [batch_size, B, 3]
+        ref_local = ref_body_w - ref_body_w[:, 0:1, :]       # subtract ref root (pelvis)
+        robot_local = robot_body_w - robot_body_w[:, 0:1, :]  # subtract robot root (pelvis)
+        body_err_mm = torch.norm(ref_local - robot_local, dim=-1) * 1000.0  # [batch_size, B]
 
         # --- Position error (g-mpjpe + l-mpjpe) accumulation ---
         active_env_ids = active.nonzero(as_tuple=True)[0]  # [K]
@@ -395,8 +408,8 @@ class MotionMetricsCallback(RLEvalCallback):
         logger.info("=" * 60)
         logger.info("=== Motion Metrics Eval Results (ASAP convention) ===")
         logger.info("=" * 60)
-        logger.info(f"  g-mpjpe   (mean over motions):     {overall_gmpjpe:.3f} mm  (world frame, includes root drift)")
-        logger.info(f"  l-mpjpe   (mean over motions):     {overall_mpjpe:.3f} mm  (root-aligned)")
+        logger.info(f"  g-mpjpe   (mean over motions):     {overall_gmpjpe:.3f} mm  (world frame, first-frame root aligned)")
+        logger.info(f"  l-mpjpe   (mean over motions):     {overall_mpjpe:.3f} mm  (ASAP/PHC: root xyz subtracted, no rotation)")
         logger.info(f"  vel_err   (mean over motions):     {overall_vel:.3f} mm  (1st-order body pos diff)")
         logger.info(f"  accel_err (mean over motions):     {overall_acc:.3f} mm  (2nd-order body pos diff)")
 
@@ -419,8 +432,8 @@ class MotionMetricsCallback(RLEvalCallback):
                 )
             lines.append("")
             lines.append("Overall (ASAP convention; vel/accel are body-pos finite diffs in mm, no dt division):")
-            lines.append(f"  g-mpjpe   (mean over motions): {overall_gmpjpe:.3f} mm  (world frame, includes root drift)")
-            lines.append(f"  l-mpjpe   (mean over motions): {overall_mpjpe:.3f} mm  (root-aligned)")
+            lines.append(f"  g-mpjpe   (mean over motions): {overall_gmpjpe:.3f} mm  (world frame, first-frame root aligned)")
+            lines.append(f"  l-mpjpe   (mean over motions): {overall_mpjpe:.3f} mm  (ASAP/PHC: root xyz subtracted, no rotation)")
             lines.append(f"  vel_err   (mean over motions): {overall_vel:.3f} mm  (1st-order body-pos diff)")
             lines.append(f"  accel_err (mean over motions): {overall_acc:.3f} mm  (2nd-order body-pos diff)")
             lines.append("")

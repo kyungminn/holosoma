@@ -1,13 +1,15 @@
 """Success rate evaluation callback for multi-motion (PhUMA) training.
 
 Evaluates policy by running all motions from initial frame and measuring
-how many the robot can track without the reference body (root / pelvis)
-deviating more than a threshold from the commanded root trajectory.
+how many the robot can track without ANY tracked body deviating more than a
+threshold from the reference motion (ASAP-style whole-body global tracking).
 
-Definition:
+Definition (ASAP-style whole-body global tracking):
   - Each motion starts at timestep 0
-  - At each step, check if root (pelvis) 3D position error > threshold
-  - If so, mark that motion as failed
+  - The reference trajectory is aligned so its first-frame root coincides with
+    the robot's spawn root (removes the init_root_offset Z lift / spawn gap)
+  - At each step, compute the global 3D position error of every tracked body
+  - If ANY tracked body's error > threshold, mark that motion as failed
   - success_rate = 1 - mean(terminate_states)
 
 Also reports per-skill and per-category success rates when a CSV metadata file
@@ -31,7 +33,8 @@ from loguru import logger
 from holosoma.agents.callbacks.base_callback import RLEvalCallback
 from holosoma.managers.command.terms.wbt import MotionLoader
 
-# Root-only thresholds: pelvis 3D position error exceeds this = fail.
+# Whole-body thresholds: if ANY tracked body's global 3D position error
+# exceeds this (after first-frame root alignment) the motion is a fail.
 MOTION_FAR_THRESHOLDS = [0.5, 0.25]
 
 
@@ -297,6 +300,8 @@ class SuccessRateCallback(RLEvalCallback):
         }
         self._current_batch = 0
         self._env_done = torch.zeros(self._num_envs, dtype=torch.bool, device=self.device)
+        # First-frame root alignment offset, (re)captured per batch in _setup_batch.
+        self._align_offset = None
 
         # Save the original pool size and max_T for restoration
         self._orig_pool_size = self._motion_library.pool_size
@@ -435,6 +440,15 @@ class SuccessRateCallback(RLEvalCallback):
         env.simulator.set_actor_root_state_tensor_robots(all_env_ids, env.simulator.robot_root_states)
         env.simulator.set_dof_state_tensor_robots(all_env_ids, env.simulator.dof_state)
 
+        # Capture the t=0 root alignment for whole-body global mpjpe: shift the
+        # reference trajectory so its first-frame root coincides with the
+        # robot's spawn root. robot_root_pos_w reads the root_states we just set
+        # (= ref root + env_origins + init_root_offset) and root_pos_w is the
+        # ref motion root at time_step 0 (+ env_origins), so this offset removes
+        # exactly the artificial init_root_offset Z lift. ASAP gets this for
+        # free by spawning the robot at the reference's start state.
+        self._align_offset = (mc.robot_root_pos_w - mc.root_pos_w).detach().clone()  # (num_envs, 3)
+
         # Reset env done tracking
         self._env_done[:] = False
         if batch_size < self._num_envs:
@@ -448,19 +462,29 @@ class SuccessRateCallback(RLEvalCallback):
         env.time_out_buf[:] = 0
 
     def _check_motion_far(self) -> dict[float, torch.Tensor]:
-        """Pelvis world-frame check, mirroring main's BadTracking.bad_ref_pos.
+        """Whole-body global tracking check (ASAP-style).
 
-        Mainline (and the restored z-3D BadTracking here) terminates training
-        when ``||ref_pos_w - robot_ref_pos_w||`` exceeds the threshold; SR
-        should measure the same quantity so an "alive" robot is also a
-        "successful" robot. This catches global xy drift (the symptom the
-        kyungminn z-only relaxation was hiding).
+        Mirrors ASAP's ``terminate_when_motion_far``: align the reference
+        trajectory so its first-frame root coincides with the robot's spawn
+        root (``self._align_offset``, captured in ``_setup_batch``), then take
+        the global 3D position error of every tracked body and fail the motion
+        if ANY body exceeds the threshold. Stricter and more faithful to
+        whole-body tracking quality than the previous root-only check.
 
         Returns dict of threshold -> (num_envs,) bool tensor.
         """
         mc = self._motion_command
-        error = torch.norm(mc.ref_pos_w - mc.robot_ref_pos_w, dim=-1)  # (num_envs,)
-        return {thresh: error > thresh for thresh in MOTION_FAR_THRESHOLDS}
+        offset = self._align_offset
+        if offset is None:
+            # Fallback (should not happen): no alignment, anchor at zero.
+            offset = torch.zeros_like(mc.robot_root_pos_w)
+        # Both ref (body_pos_w) and robot (robot_body_pos_w) are tracked-body
+        # world positions; offset cancels env_origins + init lift so frame 0
+        # coincides and the error is pure whole-body global drift.
+        ref_body = mc.body_pos_w + offset[:, None, :]  # (num_envs, n_track, 3)
+        robot_body = mc.robot_body_pos_w  # (num_envs, n_track, 3)
+        error = torch.norm(ref_body - robot_body, dim=-1)  # (num_envs, n_track)
+        return {thresh: torch.any(error > thresh, dim=-1) for thresh in MOTION_FAR_THRESHOLDS}
 
     def on_pre_eval_env_step(self, actor_state):
         if self._skip:
